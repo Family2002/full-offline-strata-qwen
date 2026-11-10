@@ -1,6 +1,6 @@
 #!/bin/sh
 # Join split release pieces back into one file and check SHA-256.
-# Usage: sh reassemble.sh Strata-0.2.13-offline-r1-linux-x86_64-portable.tar
+# Usage: sh reassemble.sh Strata-0.2.13-offline-r1-drafts.tar
 # The pieces are <name>.part-00, part-01, ... in the current directory.
 # The expected hash is the first field of the matching line in SHA256SUMS.txt.
 set -eu
