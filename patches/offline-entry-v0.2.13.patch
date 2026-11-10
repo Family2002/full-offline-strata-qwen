@@ -1,0 +1,2634 @@
+diff --git a/.github/workflows/windows-offline.yml b/.github/workflows/windows-offline.yml
+new file mode 100644
+index 0000000..6063d13
+--- /dev/null
++++ b/.github/workflows/windows-offline.yml
+@@ -0,0 +1,65 @@
++# The Windows offline entry. No installer is built and no model is downloaded.
++# GPU inference is not part of this job.
++name: Windows offline entry
++
++on:
++  pull_request:
++    paths:
++      - .github/workflows/windows-offline.yml
++      - strata_control/windows_offline.py
++      - strata_control/acquisition.py
++      - strata_control/updater.py
++      - strata_control/transfer.py
++      - strata_control/drafting_fetch.py
++      - tools/mtp_fetch.py
++      - strata_cli/cli.py
++      - strata_cli/update_cmd.py
++      - strata_cli/launch/runner.py
++      - setup.py
++      - packaging/node_runtime.py
++      - packaging/binary_deps.py
++      - apps/host/server/offline-entry.mjs
++      - apps/host/server/acquisition.mjs
++      - apps/host/server/engine-step.mjs
++      - apps/host/server/index.mjs
++      - apps/host/server/native-control.mjs
++      - apps/host/tests/offline-entry.test.mjs
++      - apps/host/tests/no-acquire.test.mjs
++      - apps/desktop/scripts/fetch-node.sh
++      - apps/desktop/scripts/fetch-node.ps1
++      - tests/terminal/test_windows_offline.py
++      - docs/WINDOWS_OFFLINE.md
++  push:
++    paths:
++      - .github/workflows/windows-offline.yml
++      - strata_control/windows_offline.py
++      - packaging/node_runtime.py
++      - tests/terminal/test_windows_offline.py
++      - apps/host/tests/offline-entry.test.mjs
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++jobs:
++  offline-entry:
++    name: ${{ matrix.os }} / offline entry tests
++    runs-on: ${{ matrix.os }}
++    strategy:
++      fail-fast: false
++      matrix:
++        os: [ubuntu-latest, windows-latest]
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++      - name: Python offline-entry tests
++        run: |
++          python -m pip install jinja2
++          python -m unittest tests.terminal.test_windows_offline
++      - uses: actions/setup-node@v4
++        with:
++          node-version: "22"
++      - name: Host offline-entry tests
++        run: node --test apps/host/tests/offline-entry.test.mjs apps/host/tests/no-acquire.test.mjs
+diff --git a/apps/desktop/scripts/fetch-node.ps1 b/apps/desktop/scripts/fetch-node.ps1
+index 2d833a9..6374cd1 100644
+--- a/apps/desktop/scripts/fetch-node.ps1
++++ b/apps/desktop/scripts/fetch-node.ps1
+@@ -58,14 +58,13 @@ try {
+     } else {
+         Write-Output 'fetch-node: sha256 verified against the recorded digest'
+     }
+-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+-    $zipFile = [IO.Compression.ZipFile]::OpenRead($Zip)
+-    try {
+-        $entry = $zipFile.GetEntry("node-v$NodeVersion-$Target/node.exe")
+-        if (-not $entry) { Fail "node.exe is not inside $Archive" }
+-        New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+-        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $Installed, $true)
+-    } finally { $zipFile.Dispose() }
++    # node.exe imports the VC++ DLLs beside it in the official zip. The closure check extracts those
++    # too and refuses a zip that does not contain one. This script is the preparation environment only.
++    $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
++    $Py = Get-Command python -ErrorAction SilentlyContinue
++    if (-not $Py) { Fail "the preparation environment needs python on PATH to unpack node.exe and the DLLs it imports. The PC that runs Strata does not run this script." }
++    & $Py.Source (Join-Path $Repo 'packaging\node_runtime.py') --zip $Zip --dest $Dest
++    if ($LASTEXITCODE -ne 0) { Fail "the Node runtime closure failed. Nothing else was installed." }
+     Write-Output "fetch-node: installed at $Installed"
+ } finally {
+     Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+diff --git a/apps/desktop/scripts/fetch-node.sh b/apps/desktop/scripts/fetch-node.sh
+index 3a36323..af04019 100755
+--- a/apps/desktop/scripts/fetch-node.sh
++++ b/apps/desktop/scripts/fetch-node.sh
+@@ -94,7 +94,12 @@ fi
+ 
+ mkdir -p "$DEST"
+ case "$ARCHIVE" in
+-  *.zip) unzip -q -j "$WORK/$ARCHIVE" "node-v$NODE_VERSION-win-x64/node.exe" -d "$DEST" ;;
++  *.zip)
++    # node.exe imports the VC++ DLLs that sit beside it in the official zip. Extract that closure;
++    # copying node.exe alone is how a PC without the redistributable fails at startup.
++    REPO="$(cd "$HERE/../../.." && pwd)"
++    python3 "$REPO/packaging/node_runtime.py" --zip "$WORK/$ARCHIVE" --dest "$DEST"
++    ;;
+   *)     tar xzf "$WORK/$ARCHIVE" -C "$WORK"
+          cp "$WORK/node-v$NODE_VERSION-$TARGET/bin/node" "$DEST/node" ;;
+ esac
+diff --git a/apps/host/server/acquisition.mjs b/apps/host/server/acquisition.mjs
+index 060c882..a1e2622 100644
+--- a/apps/host/server/acquisition.mjs
++++ b/apps/host/server/acquisition.mjs
+@@ -4,9 +4,11 @@
+  * an engine, a connector, a package or a compiler. Anything that would (the llama.cpp fetch, the cloudflared
+  * fetch) calls `require()` first, and `require()` refuses where acquiring is forbidden.
+  *
+- * Forbidden means: STRATA_NO_ACQUIRE is 1/true/yes/on, or this is the packaged app (STRATA_PACKAGED=1).
+- * The Tauri shell sets both for the host. Models the user chooses to download are a different, explicit action
+- * with its own progress and consent and do not go through here.
++ * Forbidden means: STRATA_NO_ACQUIRE is 1/true/yes/on, this is the packaged app (STRATA_PACKAGED=1),
++ * or this is the Windows offline entry (STRATA_OFFLINE_ENTRY=1). The offline entry names the missing
++ * local file and does not point at an installer. The Tauri shell sets the first two for the host.
++ * Models the user chooses to download are a different, explicit action and do not go through here,
++ * except on the offline entry, where a download is refused as well.
+  */
+ 
+ const TRUE = new Set(['1', 'true', 'yes', 'on']);
+@@ -21,11 +23,20 @@ export class AcquisitionRefused extends Error {
+   }
+ }
+ 
++export function offlineEntry(env = process.env) {
++  return String(env.STRATA_OFFLINE_ENTRY ?? '').trim() === '1';
++}
++
+ export function forbidden(env = process.env) {
+-  return TRUE.has(String(env.STRATA_NO_ACQUIRE ?? '').trim().toLowerCase()) || env.STRATA_PACKAGED === '1';
++  return offlineEntry(env) || TRUE.has(String(env.STRATA_NO_ACQUIRE ?? '').trim().toLowerCase()) || env.STRATA_PACKAGED === '1';
+ }
+ 
+ /** Call before any download or install. Throws AcquisitionRefused where acquiring is forbidden. */
+ export function require(what, command, env = process.env) {
++  if (offlineEntry(env)) {
++    const error = new AcquisitionRefused(what, command);
++    error.message = `${what} is missing from the offline folder. Nothing was downloaded and no installer was started.`;
++    throw error;
++  }
+   if (forbidden(env)) throw new AcquisitionRefused(what, command);
+ }
+diff --git a/apps/host/server/agent/plugins/strata-search.mjs b/apps/host/server/agent/plugins/strata-search.mjs
+index 1eb612c..2ae959c 100644
+--- a/apps/host/server/agent/plugins/strata-search.mjs
++++ b/apps/host/server/agent/plugins/strata-search.mjs
+@@ -7,13 +7,21 @@
+  * The profile pins `web.searchProvider` to the id registered here, so a second usable backend cannot make the choice ambiguous.
+  * Plain ESM, loaded by absolute path like strata-gate.mjs; its only imports are the app's own search modules next to the host.
+  */
+-import { createDuckDuckGoSearch } from '../../web-search-ddg.mjs';
++import { createDuckDuckGoSearch, SearchUnavailable } from '../../web-search-ddg.mjs';
+ import { createExaSearch, createPerplexitySearch } from '../../web-search-keyed.mjs';
+ 
+ export const name = 'strata-web-search';
+ export const inject = ['web'];
+ 
+ export function apply(ctx, config = {}) {
++  if (process.env.STRATA_OFFLINE_ENTRY === '1') {
++    ctx.web.registerSearchProvider({
++      id: 'offline',
++      available: () => false,
++      async search() { throw new SearchUnavailable('The offline entry does not search the web. Nothing was contacted.', 'WEB_OFFLINE'); },
++    });
++    return;
++  }
+   const keyOf = () => (config.keyEnv ? process.env[config.keyEnv] ?? '' : '');
+   // Tests only (the bridge option `searchMock`): the same search code on a pretend web, so nothing leaves the machine.
+   const pretend = config.mock === 'offline' ? { fetch: async () => { throw new TypeError('fetch failed'); } } : config.mock === 'limited' ? { fetch: async url => new Response('<html>please verify you are human: captcha</html>', { status: /duckduckgo/.test(String(url)) ? 202 : 429 }) } : null;
+diff --git a/apps/host/server/engine-step.mjs b/apps/host/server/engine-step.mjs
+index b0ed340..eaa466a 100644
+--- a/apps/host/server/engine-step.mjs
++++ b/apps/host/server/engine-step.mjs
+@@ -11,6 +11,7 @@
+  */
+ 
+ import { plainUpdateError, PHASE_TEXT } from './update-messages.mjs';
++import { isOfflineEntry } from './offline-entry.mjs';
+ 
+ const GB = 1e9;
+ const round = (value, digits = 2) => Math.round(value * 10 ** digits) / 10 ** digits;
+@@ -23,6 +24,13 @@ export function createEngineStep({ control, signal = null, onChange = () => {} }
+   const set = patch => { Object.assign(part, patch); onChange({ ...part }); };
+ 
+   async function run() {
++    if (isOfflineEntry()) {
++      let usable = false;
++      try { usable = !!(await control?.engine?.())?.usable; } catch { /* no local engine */ }
++      if (usable) { set({ state: 'skipped', message: 'The engine in the offline folder is installed. Nothing was downloaded.' }); return { ...part }; }
++      set({ state: 'failed', message: 'Missing local engine in the offline folder. Nothing was downloaded.', error: 'Missing local engine in the offline folder. Nothing was downloaded.' });
++      return { ...part };
++    }
+     if (!control || typeof control.update !== 'function') { set({ state: 'skipped', message: 'This build has no component updater.' }); return { ...part }; }
+     try {
+       set({ state: 'checking', message: 'Checking the engine for this PC…' });
+diff --git a/apps/host/server/image-models.mjs b/apps/host/server/image-models.mjs
+index 11d3825..a9146c7 100644
+--- a/apps/host/server/image-models.mjs
++++ b/apps/host/server/image-models.mjs
+@@ -62,6 +62,7 @@ export function createImageModels({ dataDir, modelsDir, real = false, changed =
+     persist(); emit(); return library();
+   }
+   function install(id) {
++    if (process.env.STRATA_OFFLINE_ENTRY === '1') throw new Error('The offline entry does not download an image model. Nothing was contacted.');
+     const v = catalog.variants.find(v => v.id === id);
+     if (!v) throw new Error('Choose an image version to download.');
+     if (installed(v) || jobs.has(id)) return library();
+diff --git a/apps/host/server/index.mjs b/apps/host/server/index.mjs
+index f2dba41..2bbd8c3 100644
+--- a/apps/host/server/index.mjs
++++ b/apps/host/server/index.mjs
+@@ -66,6 +66,7 @@ import { prepareOversized } from './oversize.mjs';
+ import { createChatFolders, chatRootOf, openFile, resolveChatFile, previewFile, rawFile, createAttachments, withAttachments } from './chat-files.mjs';
+ import { createLlmProxy, samplingFromExpert } from './agent/llm-shape.mjs';
+ import { checkUpdates, checkComponentUpdates, engineFirstRun } from './updates.mjs';
++import { isOfflineEntry, localFirstRun, localUpdateReport } from './offline-entry.mjs';
+ import { plainNoModel } from './no-model-text.mjs';
+ import { createAppUi } from './app-ui.mjs';
+ import { appVersionFrom, appVersionToShow } from './app-version.mjs';
+@@ -1399,6 +1400,7 @@ async function api(req, res, path, method, url) {
+ 
+   if (path === '/api/setup' && method === 'GET') return json(res, 200, setupState());
+   if (path === '/api/engine/first-run' && method === 'GET') {
++    if (isOfflineEntry()) return json(res, 200, localFirstRun(componentsDirectory()));
+     if (!control?.updateCheck) return json(res, 200, { status: 'unavailable', gpus: [] });
+     const info = await engineFirstRun({ control, gpus: hardware.cachedHardware()?.gpus ?? [] });
+     try { let at = componentsDirectory(); while (at && !existsSync(at) && dirname(at) !== at) at = dirname(at); const f = statfsSync(at); info.freeBytes = Number(f.bavail) * Number(f.bsize); } catch { /* unknown: no warning */ }
+@@ -1428,6 +1430,7 @@ async function api(req, res, path, method, url) {
+     await pipeline(req, createWriteStream(target, { mode: 0o600 }));
+     return json(res, 202, native.operation('install-engine-file', { path: target }));
+   }
++  if (path === '/api/updates/check' && method === 'GET' && isOfflineEntry()) return json(res, 200, localUpdateReport());
+   if (path === '/api/updates/check' && method === 'GET' && control?.updateCheck) return json(res, 200, await checkComponentUpdates({ control, appUpdater, appVersion: process.env.STRATA_APP_VERSION || null }));
+   if (path === '/api/updates/check' && method === 'GET') return json(res, 200, await checkUpdates({ appVersion:appVersionToShow(setupState().app.version,native.state().version), engineVersion:native.state().available?(native.state().installed?.engine?.version??null):(await engine.config()).engine.version }));
+ 
+@@ -1642,7 +1645,12 @@ async function api(req, res, path, method, url) {
+   // --- serving ------------------------------------------------------------
+   if (path === '/api/serving/tunnel' && method === 'GET') return json(res, 200, await cloudflare.inspect());
+   if (path === '/api/serving/tunnel' && method === 'POST') {
+-    try { const body = await readBody(req); if (body.action === 'stop') await cloudflare.stop(); else if (body.action === 'start') await cloudflare.start(body); else if (body.action === 'prepare') await cloudflare.prepare(); else throw new Error('Unknown tunnel action.'); return json(res, 200, serving.state()); }
++    try {
++      const body = await readBody(req);
++      if (isOfflineEntry() && body.action !== 'stop') throw new Error('The offline entry does not open a tunnel. Nothing was contacted.');
++      if (body.action === 'stop') await cloudflare.stop(); else if (body.action === 'start') await cloudflare.start(body); else if (body.action === 'prepare') await cloudflare.prepare(); else throw new Error('Unknown tunnel action.');
++      return json(res, 200, serving.state());
++    }
+     catch(e) { return error(res, 400, e.message); }
+   }
+   if (path === '/api/monitor/snapshot' && method === 'POST') {
+@@ -1650,7 +1658,12 @@ async function api(req, res, path, method, url) {
+     catch(e) { return error(res, 400, e.message); }
+   }
+   if (path === '/api/serving/share' && method === 'POST') {
+-    try { const body = await readBody(req); if (body.enabled === true) await localShare.start(); else await localShare.stop(); return json(res, 200, serving.state()); }
++    try {
++      const body = await readBody(req);
++      if (isOfflineEntry() && body.enabled === true) throw new Error('The offline entry does not share this server on the network. Nothing was contacted.');
++      if (body.enabled === true) await localShare.start(); else await localShare.stop();
++      return json(res, 200, serving.state());
++    }
+     catch(e) { return error(res, 400, e.message); }
+   }
+   if (path === '/api/serving' && method === 'GET') return json(res, 200, serving.state());
+diff --git a/apps/host/server/native-control.mjs b/apps/host/server/native-control.mjs
+index 088362d..665fc43 100644
+--- a/apps/host/server/native-control.mjs
++++ b/apps/host/server/native-control.mjs
+@@ -174,7 +174,7 @@ export function createNativeControl({directory,requests=()=>[],changed=()=>{},sp
+   return result;}
+  /* The folder the person picked in the first-run chooser can be the one that holds their GGUF files (or a folder inside it). It is theirs, not a Strata data folder: packs are never made in it, and a Strata folder around it (<Strata>/models/<tag>) is used instead (#3507, #3424). */
+  function ownFilesDataFolder(candidate,args){if(!candidate||args.data_dir!==undefined||!args.gguf_dir)return candidate;const same=(a,b)=>{const x=resolve(a),y=resolve(b);return process.platform==='win32'?x.toLowerCase()===y.toLowerCase():x===y;};const inside=(a,b)=>{const rel=relative(resolve(b),resolve(a));return rel===''||(!!rel&&!rel.startsWith('..')&&!isAbsolute(rel));};if(!same(candidate,args.gguf_dir)&&!inside(candidate,args.gguf_dir))return candidate;const models=dirname(resolve(args.gguf_dir)),top=dirname(models);return basename(models).toLowerCase()==='models'&&/strata/i.test(basename(top))?top:undefined;}
+- function installArgs(args,confirm){const allowed=['family','model','context','vision','kv','gpu','gpus','backend','low_ram','port','gguf_dir','drafter'];/* One drafter per run: when the choice means DFlash2 the installer does not fetch the MTP layer's ~5 GB (the drafter is fetched by the load); choosing the MTP later fetches the layer once. */if(args.drafter===undefined&&args.drafting!==undefined||args.drafter===undefined&&dflash2Served===true){const d=resolveDrafter(args.drafting,args.family,dflash2Served,dflash2Split);if(d==='dflash2')args={...args,drafter:'dflash2'};}const size=snapshot.catalog?.families?.find(f=>f.family===args.family)?.sizes.find(s=>s.model===args.model);const existing=snapshot.installed?.models?.find(m=>m.model===size?.id);/* A model adopted from the person's own GGUF folder reports that folder's parent as its data folder: it is theirs, not Strata's, so a second preparation never uses it for the packs. */if(args.gguf_dir===undefined&&existing?.ownGgufDir)args={...args,gguf_dir:existing.ownGgufDir};/* A model that is installed keeps working in the data folder its own run config names (where its pack and draft layer are), whether its files are under it or in the person's own folder: that is never changed or written to the settings from here. Only a folder taken from the app's models folder is the person's choice, and the one the installer is told about. */const own=args.data_dir===undefined?existing?.runDataFolder:undefined;const data=own??nativeDataDirectory(ownFilesDataFolder(args.data_dir??(args.gguf_dir?undefined:existing?.dataFolder)??preferences.downloadDirectory??modelsDirectory?.(),args));if(data&&packaged&&!args.data_dir&&!own)rememberDataFolder(controlSettingsFile(),data);return {...(data?{data_dir:data}:{}),...Object.fromEntries(allowed.filter(k=>args[k]!==undefined).map(k=>[k,args[k]])),/* One card is "gpu", never "gpus" (the installer wants two or more there: "Gpus='0' is not valid", #3203). */...(/^\d{1,2}$/.test(String(args.gpus??''))?{gpu:Number(args.gpus),gpus:undefined}:{}),/* Picture reading is only downloaded when it was asked for (Read pictures); the default stays the smaller download. */...(packaged&&args.vision===undefined&&args.family!=='deepseek41'?{vision:'no'}:{}),confirm};}
++ function installArgs(args,confirm){const allowed=['family','model','context','vision','kv','gpu','gpus','backend','low_ram','port','gguf_dir','drafter'];/* One drafter per run: when the choice means DFlash2 the installer does not fetch the MTP layer's ~5 GB (the drafter is fetched by the load); choosing the MTP later fetches the layer once. */if(args.drafter===undefined&&args.drafting!==undefined||args.drafter===undefined&&dflash2Served===true){const d=resolveDrafter(args.drafting,args.family,dflash2Served,dflash2Split);if(d==='dflash2')args={...args,drafter:'dflash2'};}const size=snapshot.catalog?.families?.find(f=>f.family===args.family)?.sizes.find(s=>s.model===args.model);const existing=snapshot.installed?.models?.find(m=>m.model===size?.id);/* A model adopted from the person's own GGUF folder reports that folder's parent as its data folder: it is theirs, not Strata's, so a second preparation never uses it for the packs. */if(args.gguf_dir===undefined&&existing?.ownGgufDir)args={...args,gguf_dir:existing.ownGgufDir};const offlineModel=typeof process.env.STRATA_OFFLINE_MODEL==='string'?process.env.STRATA_OFFLINE_MODEL.trim():'';if(args.gguf_dir===undefined&&process.env.STRATA_OFFLINE_ENTRY==='1'&&offlineModel)args={...args,gguf_dir:offlineModel};/* A model that is installed keeps working in the data folder its own run config names (where its pack and draft layer are), whether its files are under it or in the person's own folder: that is never changed or written to the settings from here. Only a folder taken from the app's models folder is the person's choice, and the one the installer is told about. */const own=args.data_dir===undefined?existing?.runDataFolder:undefined;const data=own??nativeDataDirectory(ownFilesDataFolder(args.data_dir??(args.gguf_dir?undefined:existing?.dataFolder)??preferences.downloadDirectory??modelsDirectory?.(),args));if(data&&packaged&&!args.data_dir&&!own)rememberDataFolder(controlSettingsFile(),data);return {...(data?{data_dir:data}:{}),...Object.fromEntries(allowed.filter(k=>args[k]!==undefined).map(k=>[k,args[k]])),/* One card is "gpu", never "gpus" (the installer wants two or more there: "Gpus='0' is not valid", #3203). */...(/^\d{1,2}$/.test(String(args.gpus??''))?{gpu:Number(args.gpus),gpus:undefined}:{}),/* Picture reading is only downloaded when it was asked for (Read pictures); the default stays the smaller download. */...(packaged&&args.vision===undefined&&args.family!=='deepseek41'?{vision:'no'}:{}),confirm};}
+ 
+  function begin(kind,run,metadata={}){if([...jobs.values()].some(j=>j.state==='running'))throw new Error('Finish or cancel the current engine operation first.');const job={id:randomUUID(),kind,state:'running',startedAt:new Date().toISOString(),summary:'Starting…',result:null,error:null,...metadata};for(const [id,old] of jobs)if(jobs.size>=12&&old.state!=='running')jobs.delete(id);jobs.set(job.id,job);emit();void run(job).then(result=>{if(job.state==='running'){Object.assign(job,{state:'done',summary:result?.summary??'Complete',result,finishedAt:new Date().toISOString()});}}).catch(error=>{if(job.state==='running')Object.assign(job,{state:'error',error:error.message,summary:error.message,...(error.details?{details:error.details}:{}),finishedAt:new Date().toISOString()});}).finally(()=>{if(job.kind.startsWith('update')||job.kind==='rollback')disconnect();lastRead=0;emit();void refresh(true);});return state().jobs.find(j=>j.id===job.id);}
+  async function watchInstall(job,current){job.summary=current.step??'Resuming preparation status…';job.result={install:current};while(job.state==='running'){await new Promise(r=>setTimeout(r,1500));const result=await tool('strata_install');job.summary=result.summary;job.result=result;emit();if(!result.install?.running){if(result.install?.exit_code!==0)throw new Error(result.install?.error??'Preparation did not finish. Retry to reuse completed files.');return {summary:'Model preparation complete. Load it from Models.'};}}}
+@@ -692,7 +692,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
+   const room=args.resourceProfile==='work';
+   return autotuner.start(job,job.kind==='recheck'?'recheck':'tune',{configPath:path,presetId:args.presetId,mode:args.mode,use:args.use,goal:room?'room':'speed',leaveRam:room?20:0,allowSmallDifferences:args.allowSmallDifferences===true,name:args.name},{onProgress:p=>{job.summary=p.text??job.summary;emit();}});
+  }
+- function operation(kind,args={}){if(!['install','load','pictures','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','install-engine-file','remove','restart-models'].includes(kind))throw new Error('Choose a supported native operation.');if(kind==='restart-models'&&!packaged)throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&(COMPONENT_KINDS.includes(kind)||kind==='restart-models')))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='pictures'?picturesOnly(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):kind==='restart-models'?restartStopped(job):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
++ function operation(kind,args={}){if(process.env.STRATA_OFFLINE_ENTRY==='1'&&(kind==='update-engine'||kind==='update-strata'))throw new Error('The offline entry does not download or install '+kind+'. Nothing was contacted.');if(!['install','load','pictures','benchmark','tune','autotune','recheck','calibrate','update-engine','update-strata','rollback','install-engine-file','remove','restart-models'].includes(kind))throw new Error('Choose a supported native operation.');if(kind==='restart-models'&&!packaged)throw new Error('Choose a supported native operation.');if(!snapshot.available&&!(packaged&&(COMPONENT_KINDS.includes(kind)||kind==='restart-models')))throw new Error(snapshot.error??'Connect the native Strata installation first.');if(kind==='install'||kind==='load'){const refusal=engineRefusal(snapshot.catalog,args.model,snapshot.engineInfo);if(refusal)throw new Error(refusal);}return begin(kind,job=>kind==='install'?install(job,args):kind==='load'?loadEngine(job,args):kind==='pictures'?picturesOnly(job,args):kind==='benchmark'?benchmark(job,args):kind==='tune'?tune(job,args):kind==='autotune'||kind==='recheck'?autotune(job,args):kind==='remove'?removeModel(job,args):kind==='restart-models'?restartStopped(job):program(job,args),{guided:args.guided===true,model:args.model,...(args.family?{family:args.family}:{})});}
+  /* ---- The models folder card (0.2.2): what a picked folder means, and the three choices. The copying is Control's (strata models move). ---- */
+  const currentModelsFolder=()=>preferences.downloadDirectory??(modelsDirectory?modelsDirectory():snapshot.installed?.data_folder)??null;
+  const moveFile=()=>join(directory,'models-move.cancel');
+diff --git a/apps/host/server/offline-entry.mjs b/apps/host/server/offline-entry.mjs
+new file mode 100644
+index 0000000..f1c66c9
+--- /dev/null
++++ b/apps/host/server/offline-entry.mjs
+@@ -0,0 +1,47 @@
++/**
++ * The Windows offline entry (`strata offline`, STRATA_OFFLINE_ENTRY=1).
++ *
++ * These answers are local. They do not call the update feed, and they do not tell the person to
++ * download or install a runtime. A missing engine names the folder it should already be in.
++ */
++import { existsSync, readdirSync } from 'node:fs';
++import { join } from 'node:path';
++
++export function isOfflineEntry(env = process.env) {
++  return String(env.STRATA_OFFLINE_ENTRY ?? '').trim() === '1';
++}
++
++export function enginePackagePresent(components, exists = existsSync, list = readdirSync) {
++  const engine = join(components, 'engine');
++  try {
++    return list(engine).some(name => exists(join(engine, name, 'engine-component.json')));
++  } catch {
++    return false;
++  }
++}
++
++export function localFirstRun(components, exists = existsSync, list = readdirSync) {
++  const engine = join(components, 'engine');
++  if (enginePackagePresent(components, exists, list)) {
++    return { status: 'installed', gpus: [], message: 'The engine in the offline folder is used. Nothing was downloaded.' };
++  }
++  return {
++    status: 'missing-local',
++    gpus: [],
++    message: `Missing local file: ${join(engine, '<package>', 'engine-component.json')}. Nothing was downloaded.`,
++  };
++}
++
++export function localUpdateReport(now = new Date().toISOString()) {
++  const message = 'The offline entry does not check for updates. Nothing was contacted.';
++  return {
++    checkedAt: now,
++    feed: null,
++    strata: { status: 'local', message },
++    engine: { status: 'local', message: 'The engine in the offline folder is used as it is. Nothing was downloaded.' },
++  };
++}
++
++export function offlineNetworkRefusal(kind) {
++  return `The offline entry does not download or install ${kind}. Nothing was contacted.`;
++}
+diff --git a/apps/host/tests/no-acquire.test.mjs b/apps/host/tests/no-acquire.test.mjs
+index 8806171..4a83c7a 100644
+--- a/apps/host/tests/no-acquire.test.mjs
++++ b/apps/host/tests/no-acquire.test.mjs
+@@ -17,12 +17,14 @@ const spy = pathToFileURL(fileURLToPath(new URL('./helpers/acquire-spy.mjs', imp
+ const delay = ms => new Promise(r => setTimeout(r, ms));
+ async function freePort() { const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const p = s.address().port; await new Promise(r => s.close(r)); return p; }
+ 
+-test('the host-side switch: STRATA_NO_ACQUIRE or the packaged app forbids acquiring, nothing else does', () => {
++test('the host-side switch: STRATA_NO_ACQUIRE, the packaged app, or the offline entry forbids acquiring', () => {
+   assert.equal(forbidden({}), false);
+   for (const v of ['1', 'true', 'YES', 'on']) assert.equal(forbidden({ STRATA_NO_ACQUIRE: v }), true, v);
+   for (const v of ['0', 'false', '', 'no']) assert.equal(forbidden({ STRATA_NO_ACQUIRE: v }), false, v);
+   assert.equal(forbidden({ STRATA_PACKAGED: '1' }), true);
++  assert.equal(forbidden({ STRATA_OFFLINE_ENTRY: '1' }), true);
+   assert.throws(() => requireAcquisition('the llama.cpp engine', undefined, { STRATA_NO_ACQUIRE: '1' }), AcquisitionRefused);
++  assert.throws(() => requireAcquisition('node.exe', undefined, { STRATA_OFFLINE_ENTRY: '1' }), err => err instanceof AcquisitionRefused && /Nothing was downloaded/.test(err.message) && !/Install it from/.test(err.message));
+   assert.doesNotThrow(() => requireAcquisition('x', undefined, {}));
+ });
+ 
+diff --git a/apps/host/tests/offline-entry.test.mjs b/apps/host/tests/offline-entry.test.mjs
+new file mode 100644
+index 0000000..02111e5
+--- /dev/null
++++ b/apps/host/tests/offline-entry.test.mjs
+@@ -0,0 +1,78 @@
++/** The Windows offline entry answers from local files. These tests do not start an engine or open a socket. */
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { fileURLToPath } from 'node:url';
++import { join } from 'node:path';
++import { isOfflineEntry, localFirstRun, localUpdateReport, offlineNetworkRefusal } from '../server/offline-entry.mjs';
++import { createEngineStep } from '../server/engine-step.mjs';
++
++const server = fileURLToPath(new URL('../server/', import.meta.url));
++
++test('a missing engine is named and the update feed is not described as a next step', () => {
++  assert.equal(isOfflineEntry({}), false);
++  assert.equal(isOfflineEntry({ STRATA_OFFLINE_ENTRY: '1' }), true);
++  const missing = localFirstRun('/opt/strata/components', () => false, () => []);
++  assert.equal(missing.status, 'missing-local');
++  assert.match(missing.message, /engine-component\.json/);
++  assert.match(missing.message, /Nothing was downloaded/);
++  assert.doesNotMatch(missing.message, /github|WebView2|winget|download the/i);
++  const present = localFirstRun('/opt/strata/components', () => true, () => ['0.1.55-windows']);
++  assert.equal(present.status, 'installed');
++  const update = localUpdateReport('2026-11-07T00:00:00.000Z');
++  assert.equal(update.checkedAt, '2026-11-07T00:00:00.000Z');
++  assert.equal(update.feed, null);
++  assert.match(update.strata.message, /Nothing was contacted/);
++  assert.match(offlineNetworkRefusal('update-engine'), /Nothing was contacted/);
++});
++
++test('the host routes consult the offline entry before the update feed', () => {
++  const index = readFileSync(join(server, 'index.mjs'), 'utf8');
++  const first = index.indexOf("path === '/api/engine/first-run'");
++  const gate = index.indexOf('isOfflineEntry()', first);
++  const online = index.indexOf('engineFirstRun(', first);
++  assert.ok(first > 0 && gate > first && gate < online, 'first-run must refuse the feed before asking it');
++  const updates = index.indexOf("path === '/api/updates/check'");
++  assert.ok(index.indexOf('isOfflineEntry()', updates) < index.indexOf('checkComponentUpdates(', updates));
++  const native = readFileSync(join(server, 'native-control.mjs'), 'utf8');
++  assert.match(native, /STRATA_OFFLINE_ENTRY==='1'&&\(kind==='update-engine'\|\|kind==='update-strata'\)/);
++  assert.match(native, /STRATA_OFFLINE_MODEL/);
++});
++
++test('web search does not fetch while the offline entry is set', async () => {
++  const previous = process.env.STRATA_OFFLINE_ENTRY;
++  process.env.STRATA_OFFLINE_ENTRY = '1';
++  try {
++    const { apply } = await import('../server/agent/plugins/strata-search.mjs');
++    let provider;
++    apply({ web: { registerSearchProvider(value) { provider = value; } } }, { provider: 'duckduckgo' });
++    await assert.rejects(() => provider.search({ query: 'local model' }), /Nothing was contacted/);
++    assert.equal(provider.available(), false);
++  } finally {
++    if (previous === undefined) delete process.env.STRATA_OFFLINE_ENTRY;
++    else process.env.STRATA_OFFLINE_ENTRY = previous;
++  }
++});
++
++test('an install job does not ask the update feed when the offline entry is set', async () => {
++  const previous = process.env.STRATA_OFFLINE_ENTRY;
++  process.env.STRATA_OFFLINE_ENTRY = '1';
++  let contacted = 0;
++  try {
++    const step = createEngineStep({
++      control: {
++        async engine() { return { usable: false }; },
++        async updateCheck() { contacted++; return {}; },
++        async update() { contacted++; return {}; },
++      },
++    });
++    const part = await step.run();
++    assert.equal(contacted, 0);
++    assert.equal(part.state, 'failed');
++    assert.match(part.message, /Nothing was downloaded/);
++    assert.equal(part.retry, undefined);
++  } finally {
++    if (previous === undefined) delete process.env.STRATA_OFFLINE_ENTRY;
++    else process.env.STRATA_OFFLINE_ENTRY = previous;
++  }
++});
+diff --git a/apps/host/tests/offline-model-host.test.mjs b/apps/host/tests/offline-model-host.test.mjs
+new file mode 100644
+index 0000000..5069a47
+--- /dev/null
++++ b/apps/host/tests/offline-model-host.test.mjs
+@@ -0,0 +1,196 @@
++/**
++ * The offline entry's host, over HTTP, with the Control process replaced by a script that records
++ * the environment it was actually started with and the install arguments it was actually sent.
++ * This does not start an engine and does not open a non-loopback socket.
++ */
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { spawn } from 'node:child_process';
++import { chmodSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
++import { mkdtemp, rm } from 'node:fs/promises';
++import { createServer } from 'node:net';
++import { tmpdir } from 'node:os';
++import { delimiter, join } from 'node:path';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++
++const root = fileURLToPath(new URL('..', import.meta.url));
++const preload = pathToFileURL(fileURLToPath(new URL('./helpers/offline-preload.mjs', import.meta.url))).href;
++const delay = ms => new Promise(r => setTimeout(r, ms));
++
++async function freePort() {
++  const s = createServer();
++  await new Promise(r => s.listen(0, '127.0.0.1', r));
++  const p = s.address().port;
++  await new Promise(r => s.close(r));
++  return p;
++}
++
++function controlScript() {
++  return `#!/usr/bin/env python3
++import json, os, sys
++record = os.environ["STRATA_CHILD_RECORD"]
++
++def dump(obj):
++    with open(record, "a", encoding="utf-8") as handle:
++        handle.write(json.dumps(obj, ensure_ascii=False) + "\\n")
++
++args = sys.argv[1:]
++if any(str(item).endswith("strata_mcp.py") for item in args):
++    dump({"kind": "mcp", "env": {key: os.environ.get(key) for key in ("STRATA_OFFLINE_ENTRY", "STRATA_OFFLINE_MODEL", "STRATA_NO_ACQUIRE", "PATH")}})
++    while True:
++        raw = sys.stdin.buffer.readline()
++        if not raw:
++            break
++        line = raw.decode("utf-8").strip()
++        if not line:
++            continue
++        msg = json.loads(line)
++        method, mid = msg.get("method"), msg.get("id")
++        if method == "initialize":
++            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fake", "version": "0"}}}), flush=True)
++        elif method == "tools/list":
++            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": name} for name in ("strata_status", "strata_models", "strata_install")]}}), flush=True)
++        elif method == "tools/call":
++            params = msg.get("params") or {}
++            name, arguments = params.get("name"), params.get("arguments") or {}
++            dump({"kind": "call", "name": name, "arguments": arguments})
++            if name == "strata_status":
++                result = {"summary": "ready", "installed": {"models": []}, "hardware": {"cpu": {"cores": 2}, "ram_gb": 16, "gpus": []}, "install": None}
++            elif name == "strata_models":
++                result = {"families": [{"family": "qwen", "sizes": [{"family": "qwen", "model": "Q4_K_M", "id": "qwen-q4"}]}], "contexts": []}
++            elif name == "strata_install":
++                result = {"summary": "recorded", "install": {"running": False, "exit_code": 0, "family": "qwen"}}
++            else:
++                result = {"summary": name or ""}
++            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"structuredContent": result}}), flush=True)
++    raise SystemExit(0)
++
++if "engine" in args:
++    print(json.dumps({"ok": True, "usable": True, "engine": {"version": "0.1.55", "backend": "cuda", "root": "engine"}, "backend": "cuda"}))
++elif "list" in args:
++    print(json.dumps({"ok": True, "install_dir": os.environ.get("STRATA_INSTALL_DIR"), "models": []}))
++elif "drafting" in args:
++    print(json.dumps({"ok": True, "serves": False, "needed": False}))
++else:
++    print(json.dumps({"ok": True}))
++`;
++}
++
++test('the host passes the offline model folder into the control install and does not call out', { timeout: 30000 }, async t => {
++  const home = await mkdtemp(join(tmpdir(), 'strata-offline-model-'));
++  t.after(() => rm(home, { recursive: true, force: true }));
++  const control = join(home, 'control');
++  const python = join(control, 'python', 'bin', 'python3');
++  mkdirSync(join(control, 'python', 'bin'), { recursive: true });
++  mkdirSync(join(control, 'strata_control'), { recursive: true });
++  mkdirSync(join(control, 'tools'), { recursive: true });
++  mkdirSync(join(control, 'serve'), { recursive: true });
++  writeFileSync(python, controlScript());
++  chmodSync(python, 0o755);
++  writeFileSync(join(control, 'strata.py'), 'print("unused")\n');
++  writeFileSync(join(control, 'BUNDLE.json'), '{"version":"0.1.55"}\n');
++  writeFileSync(join(control, 'tools', 'strata_mcp.py'), '# reached through the recorded python\n');
++  writeFileSync(join(control, 'serve', 'server.py'), '# marker\n');
++  const model = join(home, '我的模型');
++  mkdirSync(model);
++  const chosen = join(home, 'components', 'engine', 'cuda13');
++  const other = join(home, 'components', 'engine', 'cuda12');
++  mkdirSync(chosen, { recursive: true });
++  mkdirSync(other, { recursive: true });
++  const record = join(home, 'child.jsonl');
++  const log = join(home, 'net.log');
++  const port = await freePort();
++  const isolated = [chosen, '/usr/bin'].join(delimiter);
++  let output = '';
++  const host = spawn(process.execPath, ['--import', preload, 'server/index.mjs'], {
++    cwd: root,
++    stdio: ['ignore', 'pipe', 'pipe'],
++    env: {
++      ...process.env,
++      STRATA_HOME: home,
++      STRATA_MODELS_DIR: join(home, 'models'),
++      STRATA_PORT: String(port),
++      STRATA_BIND: '127.0.0.1',
++      STRATA_SHARE_PORT: String(await freePort()),
++      STRATA_TUNNEL_PORT: String(await freePort()),
++      STRATA_PACKAGED: '1',
++      STRATA_NO_BUNDLED_ENGINE: '1',
++      STRATA_REAL_ENGINE: '0',
++      STRATA_NO_ACQUIRE: '1',
++      STRATA_OFFLINE_ENTRY: '1',
++      STRATA_OFFLINE_MODEL: model,
++      STRATA_CONTROL_DIR: control,
++      STRATA_COMPONENTS_DIR: join(home, 'components'),
++      STRATA_INSTALL_DIR: home,
++      STRATA_SETTINGS_FILE: join(home, 'app-settings.json'),
++      STRATA_CHILD_RECORD: record,
++      STRATA_NET_LOG: log,
++      PATH: isolated,
++    },
++  });
++  host.stdout.on('data', d => { output += d; });
++  host.stderr.on('data', d => { output += d; });
++  t.after(async () => { host.kill(); await new Promise(r => host.once('exit', r)); });
++  let up = false;
++  for (let i = 0; i < 150 && !up; i++) {
++    try { up = (await fetch(`http://127.0.0.1:${port}/api/health`)).ok; } catch { await delay(100); }
++  }
++  assert.ok(up, `host started\n${output}`);
++  const calls = () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : []);
++  assert.deepEqual(calls(), [], `startup reached out\n${output}`);
++  const first = await fetch(`http://127.0.0.1:${port}/api/engine/first-run`);
++  assert.equal(first.status, 200);
++  assert.match((await first.json()).message, /Nothing was downloaded/);
++  const updates = await fetch(`http://127.0.0.1:${port}/api/updates/check`);
++  assert.equal(updates.status, 200);
++  assert.match((await updates.json()).strata.message, /Nothing was contacted/);
++  const blocked = await fetch(`http://127.0.0.1:${port}/api/native/operations`, {
++    method: 'POST', headers: { 'content-type': 'application/json' },
++    body: JSON.stringify({ kind: 'update-engine', args: {} }),
++  });
++  const blockedBody = await blocked.json();
++  assert.notEqual(blocked.status, 202, JSON.stringify(blockedBody));
++  assert.match(blockedBody.error ?? '', /Nothing was contacted/);
++  const native = await fetch(`http://127.0.0.1:${port}/api/native?refresh=1`);
++  const nativeBody = await native.json();
++  assert.equal(native.status, 200, JSON.stringify(nativeBody) + output);
++  assert.equal(nativeBody.available, true, (nativeBody.error ?? '') + output);
++  const posted = await fetch(`http://127.0.0.1:${port}/api/native/operations`, {
++    method: 'POST', headers: { 'content-type': 'application/json' },
++    body: JSON.stringify({ kind: 'install', args: { family: 'qwen', model: 'Q4_K_M' } }),
++  });
++  assert.equal(posted.status, 202, JSON.stringify(await posted.json()) + output);
++  let lines = [];
++  for (let i = 0; i < 50 && !lines.some(item => item.name === 'strata_install'); i++) {
++    await delay(100);
++    if (!existsSync(record)) continue;
++    lines = readFileSync(record, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
++  }
++  const started = lines.find(item => item.kind === 'mcp');
++  const install = lines.find(item => item.name === 'strata_install');
++  assert.ok(started, `control did not start\n${output}\n${readFileSync(record, 'utf8')}`);
++  assert.equal(started.env.STRATA_OFFLINE_ENTRY, '1');
++  assert.equal(started.env.STRATA_OFFLINE_MODEL, model);
++  assert.equal(started.env.STRATA_NO_ACQUIRE, '1');
++  assert.equal(started.env.PATH.split(delimiter)[0], chosen);
++  assert.equal(started.env.PATH.includes(other), false);
++  assert.ok(install, `install was not sent\n${lines.map(item => item.name || item.kind).join(',')}\n${output}`);
++  assert.equal(install.arguments.gguf_dir, model);
++  const tunnel = await fetch(`http://127.0.0.1:${port}/api/serving/tunnel`, {
++    method: 'POST', headers: { 'content-type': 'application/json' },
++    body: JSON.stringify({ action: 'start', mode: 'quick' }),
++  });
++  assert.equal(tunnel.status, 400);
++  assert.match((await tunnel.json()).error, /Nothing was contacted/);
++  const share = await fetch(`http://127.0.0.1:${port}/api/serving/share`, {
++    method: 'POST', headers: { 'content-type': 'application/json' },
++    body: JSON.stringify({ enabled: true }),
++  });
++  assert.equal(share.status, 400);
++  assert.match((await share.json()).error, /Nothing was contacted/);
++  const image = await fetch(`http://127.0.0.1:${port}/api/image-models/q4/install`, { method: 'POST' });
++  const imageBody = await image.json();
++  assert.notEqual(image.status, 200, JSON.stringify(imageBody));
++  assert.match(imageBody.error ?? '', /Nothing was contacted/);
++  assert.deepEqual(calls(), [], `an offline screen called out\n${calls().join('\n')}\n${output}`);
++});
+diff --git a/packaging/binary_deps.py b/packaging/binary_deps.py
+index ad9043c..461a3c0 100644
+--- a/packaging/binary_deps.py
++++ b/packaging/binary_deps.py
+@@ -29,7 +29,7 @@ WINDOWS_OS = (
+     "winmm.dll", "imm32.dll", "comctl32.dll", "comdlg32.dll", "dbghelp.dll", "psapi.dll", "pdh.dll", "powrprof.dll",
+     "userenv.dll", "netapi32.dll", "wininet.dll", "winhttp.dll", "dxgi.dll", "d3d11.dll", "d3d12.dll", "dwmapi.dll",
+     "dxcore.dll", "wtsapi32.dll", "ncrypt.dll", "normaliz.dll", "api-ms-win-*.dll", "ext-ms-win-*.dll", "hid.dll",
+-    "opengl32.dll", "glu32.dll", "wldap32.dll", "authz.dll", "msi.dll", "propsys.dll", "uxtheme.dll", "dnsapi.dll",
++    "opengl32.dll", "glu32.dll", "wldap32.dll", "authz.dll", "msi.dll", "cabinet.dll", "propsys.dll", "uxtheme.dll", "dnsapi.dll",
+ )
+ # Installed by the GPU driver into System32 (never redistributable by us): the CUDA driver API, the NVIDIA management library,
+ # and the AMD / Intel user-mode driver pieces the driver package owns.
+@@ -64,14 +64,13 @@ def _match(name: str, patterns: tuple[str, ...], fold: bool) -> bool:
+ 
+ 
+ # ---- readers ---------------------------------------------------------------------------------------------------------------
+-def pe_imports(path: Path) -> list[str]:
+-    """DLL names a PE file imports at load time (import table) plus delay-load imports (loaded at first call)."""
+-    data = path.read_bytes()
++def pe_imports_bytes(data: bytes, label: str = "PE") -> list[str]:
++    """DLL names in a PE image (import table) plus delay-load imports (loaded at first call)."""
+     if data[:2] != b"MZ":
+-        raise ValueError(f"{path}: not a PE file")
++        raise ValueError(f"{label}: not a PE file")
+     pe = struct.unpack_from("<I", data, 0x3C)[0]
+     if data[pe:pe + 4] != b"PE\0\0":
+-        raise ValueError(f"{path}: bad PE header")
++        raise ValueError(f"{label}: bad PE header")
+     nsec, = struct.unpack_from("<H", data, pe + 6)
+     opt_size, = struct.unpack_from("<H", data, pe + 20)
+     opt = pe + 24
+@@ -87,7 +86,7 @@ def pe_imports(path: Path) -> list[str]:
+         for va, size, raw in sections:
+             if va <= rva < va + size:
+                 return raw + rva - va
+-        raise ValueError(f"{path}: RVA {rva:#x} is outside every section")
++        raise ValueError(f"{label}: RVA {rva:#x} is outside every section")
+ 
+     def cstr(o: int) -> str:
+         end = data.index(b"\0", o)
+@@ -115,6 +114,18 @@ def pe_imports(path: Path) -> list[str]:
+     return names
+ 
+ 
++def pe_imports(path: Path) -> list[str]:
++    """DLL names a PE file imports at load time (import table) plus delay-load imports (loaded at first call)."""
++    return pe_imports_bytes(path.read_bytes(), str(path))
++
++
++def imports_bytes(data: bytes) -> tuple[str, list[str]]:
++    """(kind, names) for an in-memory file, or ("", []) when it is not an executable format this module reads."""
++    if data[:2] == b"MZ":
++        return "pe", pe_imports_bytes(data)
++    return "", []
++
++
+ def elf_needed(path: Path) -> list[str]:
+     """DT_NEEDED sonames of an ELF file (what ldd lists); libraries opened with dlopen are not visible here."""
+     data = path.read_bytes()
+diff --git a/packaging/node_runtime.py b/packaging/node_runtime.py
+new file mode 100644
+index 0000000..17504e7
+--- /dev/null
++++ b/packaging/node_runtime.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""Unpack the Windows Node zip the offline folder and the desktop bundle ship.
++
++Official nodejs.org Windows zips put node.exe next to the Visual C++ runtime DLLs it imports.
++Copying only node.exe leaves a PC without the VC++ redistributable unable to start the host, and
++Windows then shows its own missing-DLL dialog. This tool reads the PE import tables and extracts
++node.exe plus every DLL it needs that is not part of Windows or the graphics driver. A DLL the zip
++does not contain is an error: nothing is extracted and nothing is downloaded to fill the gap.
++
++This runs in the preparation environment. The Windows PC that later runs `strata offline` never
++runs it.
++"""
++from __future__ import annotations
++
++import argparse
++import sys
++import zipfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT / "packaging") not in sys.path:
++    sys.path.insert(0, str(ROOT / "packaging"))
++
++import binary_deps  # noqa: E402
++
++
++class NodeRuntimeError(RuntimeError):
++    """The zip cannot supply a DLL the runtime imports. Nothing was fetched to replace it."""
++
++
++def _basename(name: str) -> str:
++    return name.replace("\\", "/").rsplit("/", 1)[-1]
++
++
++def _find(names: list[str], wanted: str) -> str | None:
++    folded = wanted.lower()
++    for name in names:
++        if _basename(name).lower() == folded:
++            return name
++    return None
++
++
++def closure(names: list[str], read, start: str) -> list[str]:
++    """Zip member names to extract: `start` (node.exe) and every non-system DLL it reaches.
++
++    `read(member) -> bytes`. Raises NodeRuntimeError naming the missing DLL and the file that
++    imports it. Does not talk to the network.
++    """
++    chosen: list[str] = []
++    seen: set[str] = set()
++    queue = [start]
++    while queue:
++        member = queue.pop(0)
++        key = member.lower()
++        if key in seen:
++            continue
++        seen.add(key)
++        chosen.append(member)
++        try:
++            kind, imports = binary_deps.imports_bytes(read(member))
++        except (ValueError, OSError) as exc:
++            raise NodeRuntimeError(f"{_basename(member)}: cannot read its imports ({exc})") from None
++        if kind != "pe":
++            raise NodeRuntimeError(f"{_basename(member)}: not a Windows PE file, so its DLL closure cannot be checked")
++        for imported in imports:
++            if binary_deps._match(imported, binary_deps.WINDOWS_OS, True) or binary_deps._match(imported, binary_deps.WINDOWS_DRIVER, True):
++                continue
++            found = _find(names, imported)
++            if found is None:
++                raise NodeRuntimeError(
++                    f"missing local file {_basename(imported)} (imported by {_basename(member)}). "
++                    "The Node zip does not contain it. Nothing was downloaded.")
++            if found.lower() not in seen:
++                queue.append(found)
++    return chosen
++
++
++def extract(archive: Path, dest: Path) -> list[str]:
++    """Extract the closure into `dest` (flat). Returns the file names written."""
++    archive = Path(archive)
++    dest = Path(dest)
++    if not archive.is_file():
++        raise NodeRuntimeError(f"missing local file {archive}")
++    with zipfile.ZipFile(archive) as zf:
++        names = zf.namelist()
++        start = _find(names, "node.exe")
++        if start is None:
++            raise NodeRuntimeError(f"{archive.name}: no node.exe inside. Nothing was downloaded.")
++        members = closure(names, lambda name: zf.read(name), start)
++        dest.mkdir(parents=True, exist_ok=True)
++        written: list[str] = []
++        for member in members:
++            target = dest / _basename(member)
++            target.write_bytes(zf.read(member))
++            written.append(target.name)
++    return written
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description="Extract node.exe and the DLLs it imports from a local Node zip")
++    ap.add_argument("--zip", required=True, help="a node-*-win-x64.zip already on disk")
++    ap.add_argument("--dest", required=True, help="folder that receives node.exe and its DLLs")
++    args = ap.parse_args(argv)
++    try:
++        written = extract(Path(args.zip), Path(args.dest))
++    except (NodeRuntimeError, zipfile.BadZipFile, OSError) as exc:
++        print(f"node runtime: {exc}", file=sys.stderr)
++        return 1
++    print("node runtime: " + ", ".join(written))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/serve/server.py b/serve/server.py
+index 2bffac1..80defb8 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -4284,6 +4284,16 @@ def parallel_slots(cfg: dict) -> int:
+     return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 0
+ 
+ 
++def offline_requested(flag: bool) -> bool:
++    """True for --offline, and for the Windows offline entry.
++
++    `strata runtime start` does not pass --offline. The entry still puts STRATA_OFFLINE_ENTRY=1 on
++    the server, and that has to turn off remote image URLs, MCP subprocesses and profile network
++    sources. An ordinary start leaves the flag unset, so this stays off.
++    """
++    return bool(flag) or os.environ.get("STRATA_OFFLINE_ENTRY") == "1"
++
++
+ def child_env(cfg: dict, *, offline: bool = False) -> dict:
+     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
+     compiled it) first on the library search path."""
+@@ -4317,6 +4327,10 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
+     if dirs:
+         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
++    if offline or os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        # The engine directory stays. A CUDA toolkit directory inherited from the user does not.
++        from strata_control.windows_offline import path_without_cuda_toolkit
++        env["PATH"] = path_without_cuda_toolkit(env.get("PATH", ""), keep=dirs)
+     if cfg.get("backend") == "hip":
+         hip_env_guard(env, cfg)
+         note = sh_stream_warning(env, cfg)
+@@ -9938,6 +9952,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
+                          "{\"prefill_gpu\": 0, \"decode_gpu\": 1}; docs/SPLIT_SERVE.md)")
+     launch_args = list(sys.argv[1:] if argv is None else argv)
+     a = ap.parse_args(launch_args)
++    a.offline = offline_requested(a.offline)
+     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
+         print("[strata] WARNING: " + _rt, flush=True)
+     global OPENS_BROWSER
+diff --git a/setup.py b/setup.py
+index cda3580..93d193e 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1114,7 +1114,13 @@ def ask(question, choices, default, yes):
+ 
+ def _urlopen(req, timeout=None):
+     """Every network request of this file goes through here: starting and serving never reach the network
+-    (strata_control/acquisition.py), only an explicit setup, update or install does."""
++    (strata_control/acquisition.py), only an explicit setup, update or install does.
++    The offline entry refuses http(s) here as well as in download(). The install job clears
++    STRATA_NO_ACQUIRE, so acquisition.require alone would let github_reachable and the other direct
++    callers open a socket."""
++    url = getattr(req, "full_url", None) or str(req)
++    if str(url).startswith(("http://", "https://")) and os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        fail(f"the offline entry does not fetch {url}", "Nothing was downloaded.")
+     acquisition.require("a download")
+     try:
+         return urllib.request.urlopen(req, timeout=timeout)
+@@ -1149,9 +1155,16 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
+     return r
+ 
+ 
++def offline_entry() -> bool:
++    return os.environ.get("STRATA_OFFLINE_ENTRY") == "1"
++
++
+ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
+     """The ~5 GB of MTP tensors (tools/mtp_fetch.py).  A timeout or a dropped connection stops one run, not the install (#3214 #3193):
+     it is run again, and each run continues where the last one stopped.  The progress lines it prints are what the app shows."""
++    if os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        fail(f"missing local directory {mtp}",
++             "the offline entry does not download the draft layer. Place the prepared files there; nothing was fetched")
+     cmd = [sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)]
+     env = {**env, "STRATA_SOURCE": model_source()}
+     for n in range(1, tries + 1):
+@@ -3292,6 +3305,8 @@ def download(url, dst: Path, what=None):
+             mark(dst, f"sha256 {pin_here[1]}")
+             ok(f"{what or dst.name} is already here (checked)")
+             return
++    if str(url).startswith(("http://", "https://")) and os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        fail(f"missing local file {dst}", f"the offline entry does not fetch {what or dst.name}")
+     acquisition.require(what or dst.name)
+     if not url.startswith(("http://", "https://")):
+         src = Path(url[7:] if url.startswith("file://") else url)
+@@ -3875,6 +3890,14 @@ def llama_cpp_if_here():
+ 
+ def get_llama_cpp():
+     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
++    if os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        # Read the install dir at call time. The offline entry never falls through to the zip below.
++        base = Path(os.environ["STRATA_INSTALL_DIR"]) if os.environ.get("STRATA_INSTALL_DIR") else home()
++        llama = base / "third_party" / "llama.cpp"
++        if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
++            return llama
++        fail(f"missing local directory {llama / 'gguf-py'} (marker {llama / 'ggml' / 'CMakeLists.txt'})",
++             "the offline entry does not download llama.cpp and does not run git or cmake")
+     llama = home() / "third_party" / "llama.cpp"
+     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+         return llama
+@@ -3978,7 +4001,9 @@ def pip_install(packages, what, extra=()):
+     if CONTROL:                                        # the app ships these (hash-locked); nothing is installed here
+         missing = control_missing_packages()
+         if missing:
+-            fail("this copy of Strata Control lacks " + ", ".join(missing), "reinstall the Strata app")
++            hint = ("the offline folder's Python is missing these packages; this entry does not run pip"
++                    if os.environ.get("STRATA_OFFLINE_ENTRY") == "1" else "reinstall the Strata app")
++            fail("this copy of Strata Control lacks " + ", ".join(missing), hint)
+         ok(f"{what}: bundled with the app")
+         return
+     stamp = Path(sys.prefix) / ".strata-pip.json"
+@@ -6080,6 +6105,9 @@ def cuda_apt_repo(osr):
+ 
+ def install_build_tools(gpu, yes):
+     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
++    if os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        fail("the offline entry does not install a compiler or the CUDA toolkit",
++             "use the engine package already in components/engine; nothing was passed to winget")
+     acquisition.require("the compiler and CUDA toolkit")
+     archs = [int(x) for x in gpu.get("archs", [gpu["arch"]])]
+     # #295: Pascal / Volta need a CUDA 12.x toolkit - CUDA 13 cannot build sm_60/sm_70; gpu["toolkit"] = 12: the
+@@ -9923,10 +9951,16 @@ def mac_control_setup(a) -> int:
+         if near is not None:
+             mmproj = near
+         elif not (mmproj.exists() and done(mmproj)):
+-            download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+-        if fam["mmproj"] in ISTA_FILES:
++            if offline_entry():
++                warn(f"missing local file {mmproj} (picture encoder). Pictures stay off. Nothing was downloaded.")
++                vision = "none"
++                mmproj = None
++            else:
++                download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
++        if mmproj is not None and fam["mmproj"] in ISTA_FILES:
+             verify_sha256(mmproj, *ISTA_FILES[fam["mmproj"]])
+-        ok(f"vision encoder: {mmproj}")
++        if mmproj is not None:
++            ok(f"vision encoder: {mmproj}")
+ 
+     step(6, "preparing the model for Strata")
+     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+@@ -9963,6 +9997,9 @@ def mac_control_setup(a) -> int:
+         ok("DFlash2 is the drafter: the MTP draft layer's ~5 GB are not downloaded (choosing the MTP later fetches it once)")
+         provide_dflash2_vocab(data, a.draft_vocab or "cjk")
+         use_mtp = False
++    elif use_mtp and not (mtp / "mtp-q2_0.gguf").exists() and offline_entry():
++        ok("the draft layer is not among the local files, so it stays off. Nothing was downloaded.")
++        use_mtp = False
+     if use_mtp and not (mtp / "mtp-q2_0.gguf").exists():
+         say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: only its ~5 GB of MTP tensors are downloaded.")
+         fetch_mtp(mtp, env)
+@@ -10995,12 +11032,19 @@ def main() -> int:
+         near = None if mmproj.exists() else mmproj_beside(a.gguf_dir, fam["mmproj"], (fam.get("mmproj_sha256") or ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
+         if near is not None:                           # the person's own folder (or the one above it) has the picture file: used where it is
+             mmproj = near
+-        else:
++        elif not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
++            mmproj = Path(a.gguf_dir) / fam["mmproj"]
++        elif not mmproj.exists() and offline_entry():
++            warn(f"missing local file {mmproj} (picture encoder). Pictures stay off. Nothing was downloaded.")
++            vision = "none"
++            mmproj = None
++        elif not mmproj.exists():
+             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+-        if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
++        if mmproj is not None and fam.get("mmproj_sha256"):   # the NVFP4 family pins it by size and SHA-256 too
+             verify_sha256(mmproj, *fam["mmproj_sha256"])
+-        ok(f"vision encoder: {mmproj}")
+-        if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
++        if mmproj is not None:
++            ok(f"vision encoder: {mmproj}")
++        if mmproj is not None and vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
+             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
+                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
+ 
+@@ -11044,14 +11088,18 @@ def main() -> int:
+         (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
+     rt = mtp / "rt"
+     corrupt = (rt / "experts.bin").exists() and not prepared and mtp_corrupt(mtp, env)
+-    if corrupt:
++    if corrupt and not offline_entry():
+         warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
+              "fetching them again and rebuilding the draft layer")
++    elif corrupt:
++        warn("the local draft layer is not usable, so it stays off. Nothing was downloaded.")
+     if a.mtp == "off" and not (rt / "experts.bin").exists():
+         ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
+     elif getattr(a, "drafter", None) == "dflash2" and not (rt / "experts.bin").exists():
+         ok("DFlash2 is the drafter: the MTP draft layer's ~5 GB are not downloaded (choosing the MTP later fetches it once)")
+         provide_dflash2_vocab(data, a.draft_vocab or saved_draft_vocab(home() / f"strata-{tag.lower()}.json") or "cjk")
++    elif offline_entry() and (corrupt or not (rt / "experts.bin").exists()):
++        ok("the draft layer is not among the local files, so it stays off. Nothing was downloaded.")
+     elif corrupt or not (rt / "experts.bin").exists():
+         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
+         say("  only its ~5 GB of MTP tensors are downloaded.")
+diff --git a/strata_cli/cli.py b/strata_cli/cli.py
+index 059a00c..38ea33d 100644
+--- a/strata_cli/cli.py
++++ b/strata_cli/cli.py
+@@ -65,6 +65,13 @@ def parser() -> argparse.ArgumentParser:
+     serve.add_argument("--json", action="store_true", help="alias for --plan --output json")
+     serve.add_argument("--quiet", action="store_true", help="suppress human informational output")
+ 
++    offline = sp.add_parser("offline", help="start the local page from a prepared folder; downloads nothing and installs nothing")
++    offline.add_argument("--root", required=True, help="the prepared folder (node, host, control, components, third_party)")
++    offline.add_argument("--model", default=None, help="optional local .gguf file or folder; the page can choose it later")
++    offline.add_argument("--port", type=int, default=8791)
++    offline.add_argument("--cuda", choices=("12", "13", "sycl"), default=None, help="use this engine only: 12, 13, or sycl (Intel Arc, Linux package)")
++    offline.add_argument("--plan", action="store_true", help="check the folder and print the address; do not start")
++
+     profile = sp.add_parser("profile", help="edit saved serving overrides outside setup's run config")
+     profile_sp = profile.add_subparsers(dest="profile_command", required=True)
+     profile_create = profile_sp.add_parser("create", help="save a named profile from an installed run config")
+@@ -2163,6 +2170,12 @@ def _run(a: argparse.Namespace) -> int:
+             return _timeskip(a)
+         if a.command == "presets":
+             return tune_commands.presets_command(a)
++        if a.command == "offline":
++            from strata_control.windows_offline import main as offline_main
++            argv = ["--root", a.root, "--port", str(a.port), *(["--plan"] if a.plan else []), *(["--cuda", a.cuda] if a.cuda else [])]
++            if a.model:
++                argv[2:2] = ["--model", a.model]
++            return offline_main(argv)
+         if a.command in ("launch", "connect"):
+             from strata_cli.launch import cmd as launch_cmd
+             return launch_cmd.run_launch(a) if a.command == "launch" else launch_cmd.run_connect(a)
+diff --git a/strata_cli/launch/runner.py b/strata_cli/launch/runner.py
+index b117184..6979e32 100644
+--- a/strata_cli/launch/runner.py
++++ b/strata_cli/launch/runner.py
+@@ -695,7 +695,8 @@ class Runner:
+ 
+     def _env(self) -> dict[str, str]:
+         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+-        env.pop("STRATA_NO_ACQUIRE", None)                  # launch is the explicit step that may download
++        if os.environ.get("STRATA_OFFLINE_ENTRY") != "1":
++            env.pop("STRATA_NO_ACQUIRE", None)              # launch is the explicit step that may download; the offline entry is not
+         if self.components_dir:
+             env["STRATA_COMPONENTS_DIR"] = self.components_dir
+         return env
+@@ -738,6 +739,17 @@ class Runner:
+ 
+     # ---- 1. the engine
+     def ensure_engine(self) -> None:
++        if os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++            from strata_control import engine_component as ec
++            root = Path(self.components_dir) if self.components_dir else None
++            report = ec.status(root)
++            if report.get("usable"):
++                eng = report["engine"]
++                self.emit("engine", f"Engine {eng['version']} ({eng['backend']}) is installed.", 100)
++                return
++            where = root or "the components folder"
++            raise LaunchError(f"Missing local engine under {where}. The offline entry does not download one.",
++                              "Place the engine package in components/engine and run again. Nothing was downloaded.", 5)
+         self.warn_wsl_amd()
+         if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
+             self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
+diff --git a/strata_cli/update_cmd.py b/strata_cli/update_cmd.py
+index ddb3b71..6801389 100644
+--- a/strata_cli/update_cmd.py
++++ b/strata_cli/update_cmd.py
+@@ -326,6 +326,8 @@ def run(a) -> int:
+             else:
+                 print(out.get("note") or _line("Engine", out))
+             return 0
++        if os.environ.get("STRATA_OFFLINE_ENTRY", "").strip() == "1":
++            return fail("The offline entry does not contact the update feed. Nothing was downloaded.", 5)
+         acquisition.require("the update", "`strata update` from a terminal")
+         trusted = signing.load_trusted_keys()
+         ctx.trusted = trusted
+diff --git a/strata_control/acquisition.py b/strata_control/acquisition.py
+index a61e6b4..42ce36a 100644
+--- a/strata_control/acquisition.py
++++ b/strata_control/acquisition.py
+@@ -38,6 +38,9 @@ class AcquisitionRefused(RuntimeError):
+     def __init__(self, what: str, command: str | None = None):
+         self.what = what
+         self.command = command or explicit_commands()
++        if os.environ.get("STRATA_OFFLINE_ENTRY", "").strip() == "1":
++            super().__init__(f"{what} is missing from the offline folder. Nothing was downloaded and no installer was started.")
++            return
+         super().__init__(
+             f"{what} is missing or out of date. Starting and serving never install or download "
+             f"anything. Run: {self.command}")
+diff --git a/strata_control/drafting_fetch.py b/strata_control/drafting_fetch.py
+index f320cf2..270e9c3 100644
+--- a/strata_control/drafting_fetch.py
++++ b/strata_control/drafting_fetch.py
+@@ -319,6 +319,8 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
+             convert_selector(data_dir, progress=report)
+         report("The DFlash2 drafter is ready.", 1, 1)
+         return drafting.pack_path(data_dir)
++    if os.environ.get("STRATA_OFFLINE_ENTRY", "").strip() == "1":
++        raise DraftingError("The DFlash2 drafter is not in the offline folder. Nothing was downloaded.")
+     acquisition.require("the DFlash2 drafter", "strata drafting fetch")
+     folder = out.parent
+     src = folder / "src"
+diff --git a/strata_control/transfer.py b/strata_control/transfer.py
+index 0ffbd9d..915a3d0 100644
+--- a/strata_control/transfer.py
++++ b/strata_control/transfer.py
+@@ -165,11 +165,20 @@ def _open_small(request, timeout: float, limit: int) -> bytes:
+         return response.read(limit + 1)
+ 
+ 
++def refuse_offline_network(location: str) -> None:
++    """The Windows offline entry never fetches http(s). A local path or file URL is left alone."""
++    if os.environ.get("STRATA_OFFLINE_ENTRY", "").strip() != "1":
++        return
++    if kind_of(location) in ("http", "https"):
++        raise TransferError(f"missing local file for {location}. The offline entry does not download it.")
++
++
+ def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30) -> bytes:
+     """A small document (the feed, its signature). Larger than `limit` is refused, not truncated.
+     A web address gets one more try when the first one times out or the connection fails: about one request in 25 to github.com hung for the whole
+     timeout on a PC whose next 24 answered in half a second (measured on a 3060 PC: the first-run card said "offline" a moment before the install's
+     own read worked). The first try therefore waits at most 12 s; the second the full `timeout`."""
++    refuse_offline_network(location)
+     kind = kind_of(location)
+     _SERVER_DATE.clear()                                 # only the answer of this read counts
+     try:
+@@ -219,6 +228,7 @@ def download(location: str, partial: Path, *, size: int, sha256: str,
+     """Fetch `location` into `partial` (resuming what is there) and return it once it has exactly `size` bytes and the
+     SHA-256 `sha256`. An interrupted transfer keeps the partial file (`TransferError.resumable`); a complete file with the
+     wrong hash is deleted, because resuming cannot repair it."""
++    refuse_offline_network(location)
+     partial = Path(partial)
+     partial.parent.mkdir(parents=True, exist_ok=True)
+     have = partial.stat().st_size if partial.exists() else 0
+diff --git a/strata_control/updater.py b/strata_control/updater.py
+index 08540da..9ffacc9 100644
+--- a/strata_control/updater.py
++++ b/strata_control/updater.py
+@@ -497,6 +497,8 @@ def _free_space_check(root: Path, need: int, ctx: "Context | None" = None, sha25
+ 
+ 
+ def _download(ctx: Context, state_name: str, url_ref: str, size: int, sha256: str, label: str, feed: feedmod.Feed) -> Path:
++    if os.environ.get("STRATA_OFFLINE_ENTRY", "").strip() == "1":
++        raise UpdateError(f"missing local file for {label}. The offline entry does not download it.", 5)
+     work = updates_dir(ctx.components) / "partial"
+     partial = work / f"{sha256[:16]}.part"
+     start = time.monotonic()
+diff --git a/strata_control/windows_offline.py b/strata_control/windows_offline.py
+new file mode 100644
+index 0000000..6884c87
+--- /dev/null
++++ b/strata_control/windows_offline.py
+@@ -0,0 +1,837 @@
++"""Windows offline entry: a local page, a bundled runtime, no installer and no download.
++
++The desktop installer asks Windows for Microsoft WebView2 and will download that installer when
++the PC does not already have it. This entry does not start that shell. It starts the same App Host
++with the Node binary that was packed beside it, and prints http://127.0.0.1:<port>/ for a browser
++the PC already has.
++
++It is opt-in (`strata offline`). `strata launch`, the desktop app and `strata update` keep their
++own behaviour.
++
++What the preparation environment puts in the folder is checked here, including the PE import
++closure of Node, the bundled Python and the engine. A missing file is named and the process
++exits. Nothing in this module opens a socket, runs winget, pip, git or cmake, or starts an
++installer.
++
++Host prerequisites this module does not carry and does not install: Windows 10/11 x64, the
++graphics driver for the engine package (nvcuda.dll or the AMD driver), and the Windows libraries
++listed in packaging/binary_deps.py WINDOWS_OS (kernel32.dll, ucrtbase.dll, and the rest of that
++tuple). WebView2, a separate Python, a separate Node, the Visual C++ redistributable and the CUDA
++toolkit are not prerequisites: their DLLs have to be in the folder, or the closure check fails.
++"""
++from __future__ import annotations
++
++import os
++import re
++import struct
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++
++ENV = "STRATA_OFFLINE_ENTRY"
++
++# Architectures this entry will point at local tools for. Anything else is refused here, before a
++# download or a compiler could be offered. qwen4exp is Qwen3.8-Flash-Next; deepseek41 is
++# DeepSeek-V4.1-Flash. Helper GGUFs (a picture reader, a PLE table) are not models.
++MODEL_ARCH = {
++    "qwen4exp": "strata.exe",
++    "deepseek41": "strata-dsv41.exe",
++}
++HELPER_ARCH = {"strata-ple", "strata-embd", "engram", "deepseek41-engram", "controlvector"}
++
++# Files the folder must contain. The llama.cpp tree is the Python preparation tools (gguf-py).
++# ggml/CMakeLists.txt is the marker get_llama_cpp already uses; this entry never runs cmake.
++RUNTIME_FILES = (
++    "node/node.exe",
++    "host/server/index.mjs",
++    "host/dist/index.html",
++    "control/python/python.exe",
++    "control/strata.py",
++    "control/strata_control/__init__.py",
++    "third_party/llama.cpp/gguf-py/gguf/__init__.py",
++    "third_party/llama.cpp/ggml/CMakeLists.txt",
++)
++
++HOST_PREREQUISITES = (
++    "Windows 10 or Windows 11, x64",
++    "the graphics driver for the engine package already in this folder (NVIDIA or AMD). "
++    "Strata does not install it",
++    "Windows' own libraries (kernel32.dll, ucrtbase.dll and the rest of WINDOWS_OS in "
++    "packaging/binary_deps.py). The Visual C++ runtime is not one of them: it has to sit next to "
++    "node.exe and python.exe",
++)
++
++LINUX_RUNTIME_FILES = (
++    "node/node",
++    "host/server/index.mjs",
++    "host/dist/index.html",
++    "control/python/bin/python3",
++    "control/strata.py",
++    "control/strata_control/__init__.py",
++    "third_party/llama.cpp/gguf-py/gguf/__init__.py",
++    "third_party/llama.cpp/ggml/CMakeLists.txt",
++)
++
++LINUX_HOST_PREREQUISITES = (
++    "Linux x86_64 (glibc, as on current Debian, Ubuntu or similar)",
++    "the graphics driver already on this machine: NVIDIA for the CUDA engines, or the Intel "
++    "GPU driver (Level Zero) for the SYCL engine. Strata does not install a driver",
++    "Linux libraries named in packaging/binary_deps.py LINUX_OS (libc, libstdc++, libgomp, and the rest). "
++    "A library that is not in that list has to sit in the engine or Python folder",
++)
++
++
++def payload_kind(root: Path) -> str:
++    """Which operating system this prepared folder is for.
++
++    A Windows payload carries node.exe. A Linux payload carries node/node and does not carry
++    node.exe. An empty folder stays Windows so the missing-file list keeps the names the
++    Windows tests already check.
++    """
++    root = Path(root)
++    if (root / "node" / "node").is_file() and not (root / "node" / "node.exe").is_file():
++        return "linux"
++    if (root / "control" / "python" / "bin" / "python3").is_file() and not (root / "control" / "python" / "python.exe").is_file():
++        return "linux"
++    return "windows"
++
++
++def runtime_files_for(root: Path) -> tuple[str, ...]:
++    return LINUX_RUNTIME_FILES if payload_kind(root) == "linux" else RUNTIME_FILES
++
++
++def host_prerequisites_for(root: Path) -> tuple[str, ...]:
++    return LINUX_HOST_PREREQUISITES if payload_kind(root) == "linux" else HOST_PREREQUISITES
++
++
++def active(environ: dict | None = None) -> bool:
++    env = os.environ if environ is None else environ
++    return str(env.get(ENV, "")).strip() == "1"
++
++
++@dataclass
++class Issue:
++    path: str
++    reason: str
++
++    def line(self) -> str:
++        return f"{self.path}: {self.reason}"
++
++
++@dataclass
++class Report:
++    root: Path
++    model: Path
++    issues: list[Issue] = field(default_factory=list)
++    url: str = ""
++    argv: list[str] = field(default_factory=list)
++    env: dict[str, str] = field(default_factory=dict)
++    proc: object | None = None
++    choice_note: str = ""
++
++    @property
++    def ok(self) -> bool:
++        return not self.issues
++
++
++class OfflineStop(Exception):
++    """The folder is not complete. exit_code 5 matches Strata's other 'not started' stops."""
++
++    exit_code = 5
++
++    def __init__(self, issues: list[Issue]):
++        self.issues = issues
++        super().__init__("\n".join(issue.line() for issue in issues))
++
++
++def _deps():
++    """The PE closure checker. It lives in packaging/ in a source checkout.
++
++    The offline installer copies that one file to control/packaging/binary_deps.py. This file is
++    then control/strata_control/windows_offline.py, so the parent of strata_control is control, and
++    control/packaging is the same relative place as <repo>/packaging in a checkout.
++    """
++    here = Path(__file__).resolve()
++    candidates = [here.parents[1] / "packaging", here.parent]
++    for folder in candidates:
++        if (folder / "binary_deps.py").is_file():
++            folder_s = str(folder)
++            if folder_s not in sys.path:
++                sys.path.insert(0, folder_s)
++            import binary_deps
++            return binary_deps
++    raise ModuleNotFoundError(
++        "binary_deps.py is not in the offline install (expected control/packaging/binary_deps.py). "
++        "Nothing was downloaded.")
++
++
++def _reader():
++    tools = str(Path(__file__).resolve().parents[1] / "tools")
++    if tools not in sys.path:
++        sys.path.insert(0, tools)
++    import gguf_reader
++    return gguf_reader
++
++
++# Names a CUDA toolkit directory puts on PATH. The driver DLL (nvcuda.dll) is not one of these.
++_CUDA_TOOLKIT_PREFIXES = (
++    "cublas64_", "cublaslt64_", "cudart64_", "nvrtc64_", "cufft64_", "curand64_",
++    "cusparse64_", "cusolver64_", "nvjitlink64_",
++)
++_DLL_JOIN = re.compile(
++    r"os\.path\.join\(\s*os\.path\.dirname\(\s*__file__\s*\)\s*,(?P<parts>.*?)\)",
++    re.S,
++)
++
++
++def _machine_codes(package: dict) -> list[int]:
++    found = []
++    for arch in package.get("archs") or []:
++        kind, _, number = str(arch).partition("_")
++        if kind == "sm" and number.isdigit():
++            found.append(int(number))
++    return found
++
++
++def directory_has_cuda_toolkit_dll(folder: Path) -> bool:
++    """True when this directory itself holds a CUDA toolkit library (not a file in a subdirectory)."""
++    try:
++        names = [item.name.lower() for item in folder.iterdir() if item.is_file()]
++    except OSError:
++        return False
++    return any(name.startswith(_CUDA_TOOLKIT_PREFIXES) and name.endswith(".dll") for name in names)
++
++
++def path_without_cuda_toolkit(path: str, *, keep: list[str] | None = None) -> str:
++    """Drop PATH entries that contain a CUDA toolkit DLL.
++
++    The chosen engine directory is kept: its cuBLAS is the one the package shipped. A toolkit
++    installed on the PC is not. Windows still searches System32 for the driver without PATH.
++    """
++    keep_resolved: set[str] = set()
++    for item in keep or []:
++        try:
++            keep_resolved.add(str(Path(item).resolve()))
++        except OSError:
++            keep_resolved.add(str(item))
++    kept: list[str] = []
++    for entry in str(path or "").split(os.pathsep):
++        if not entry:
++            continue
++        try:
++            resolved = str(Path(entry).resolve())
++        except OSError:
++            resolved = entry
++        if resolved in keep_resolved or not directory_has_cuda_toolkit_dll(Path(entry)):
++            kept.append(entry)
++    return os.pathsep.join(kept)
++
++
++def _added_dll_directories(folder: Path) -> dict[Path, set[Path]]:
++    """Directories a package adds with os.add_dll_directory, keyed by the package directory.
++
++    CPython 3.8+ does not search PATH or an arbitrary subdirectory for an extension's DLLs. It
++    searches the extension's own directory, the directory added at startup (python.exe's folder),
++    and directories an imported module passed to add_dll_directory. NumPy's delvewheel patch is
++    that last kind: numpy/__init__.py adds the sibling numpy.libs folder.
++    """
++    registered: dict[Path, set[Path]] = {}
++    for script in folder.rglob("*.py"):
++        try:
++            text = script.read_text(encoding="utf-8", errors="ignore")
++        except OSError:
++            continue
++        if "add_dll_directory" not in text:
++            continue
++        for match in _DLL_JOIN.finditer(text):
++            parts = []
++            for pardir, double, single in re.findall(r"(os\.pardir)|\"([^\"]+)\"|'([^']+)'", match.group("parts")):
++                if pardir:
++                    parts.append("..")
++                elif double or single:
++                    parts.append(double or single)
++            if not parts:
++                continue
++            target = script.parent
++            for part in parts:
++                target = target.parent if part == ".." else target / part
++            if target.is_dir():
++                registered.setdefault(script.parent, set()).add(target)
++    return registered
++
++
++def _names_in(folder: Path) -> set[str]:
++    try:
++        return {item.name.lower() for item in folder.iterdir() if item.is_file()}
++    except OSError:
++        return set()
++
++
++def closure_issues(folder: Path, *, python_runtime: bool = False) -> list[Issue]:
++    """PE files under `folder` whose imports the loader would not find.
++
++    An engine or Node binary is resolved like a normal Windows exe: its own directory, then
++    BUILD.json lib_dirs. PATH is not counted, so a CUDA toolkit on the PC cannot fill a gap.
++    A CPython tree also counts directories its packages add with add_dll_directory, and the
++    python.exe directory CPython adds at startup. A DLL that merely exists somewhere else in
++    the tree does not count.
++    """
++    if not folder.is_dir():
++        return [Issue(str(folder), "missing local directory. Nothing was downloaded.")]
++    deps = _deps()
++    lib_dirs = {folder}
++    build = folder / "BUILD.json"
++    if build.is_file():
++        try:
++            import json
++            for rel in json.loads(build.read_text(encoding="utf-8")).get("lib_dirs", []):
++                lib_dirs.add(folder / str(rel))
++        except (OSError, ValueError):
++            pass
++    registered = _added_dll_directories(folder) if python_runtime else {}
++    app_names = _names_in(folder)
++    skip = {".json", ".txt", ".md", ".cu", ".h", ".py", ".yaml", ".yml", ".metallib", ".bin", ".html", ".mjs", ".js", ".css", ".map", ".svg"}
++    problems: list[Issue] = []
++    for path in sorted(folder.rglob("*")):
++        if not path.is_file() or path.is_symlink() or path.suffix.lower() in skip:
++            continue
++        try:
++            kind, names = deps.imports(path)
++        except (OSError, ValueError):
++            continue
++        if kind != "pe":
++            continue
++        allowed = set(app_names)
++        allowed.update(_names_in(path.parent))
++        for lib in lib_dirs:
++            allowed.update(_names_in(lib))
++        if python_runtime:
++            for parent in [path.parent, *path.parents]:
++                for added in registered.get(parent, ()):
++                    allowed.update(_names_in(added))
++                if parent == folder:
++                    break
++        for name in names:
++            if name.lower() in allowed:
++                continue
++            if deps._match(name, deps.WINDOWS_OS, True) or deps._match(name, deps.WINDOWS_DRIVER, True):
++                continue
++            problems.append(Issue(
++                str(path),
++                f"needs {name}, which is not next to it, not in a directory this runtime adds, and not a Windows or graphics-driver library. Nothing was downloaded."))
++    return problems
++
++
++def _origin_library_present(folder: Path, rel: str, name: str) -> bool:
++    """True when an ELF NEEDED entry is `$ORIGIN/...` and that file is inside this folder.
++
++    python-build-standalone's libpython3.so records `$ORIGIN/../lib/libpython3.12.so.1.0`.
++    That is the copy beside it, not a library the operating system must provide.
++    """
++    if not str(name).startswith("$ORIGIN"):
++        return False
++    origin = (folder / rel).parent
++    rest = str(name)[len("$ORIGIN"):].lstrip("/")
++    try:
++        target = (origin / rest).resolve()
++        target.relative_to(folder.resolve())
++    except (OSError, ValueError):
++        return False
++    return target.is_file()
++
++
++def elf_closure_issues(folder: Path) -> list[Issue]:
++    """ELF files under `folder` whose NEEDED libraries are not in the folder or the OS/driver list.
++
++    `binary_deps.uncovered` is the same rule the engine packager uses. A CUDA toolkit on the
++    machine is not searched. Nothing is downloaded to fill a gap.
++    """
++    if not folder.is_dir():
++        return [Issue(str(folder), "missing local directory. Nothing was downloaded.")]
++    deps = _deps()
++    problems = []
++    for rel, name in deps.uncovered(folder):
++        if _origin_library_present(folder, rel, name):
++            continue
++        problems.append(Issue(
++            str(folder / rel),
++            f"needs {name}, which is not in this folder and not a Linux or graphics-driver library. Nothing was downloaded."))
++    return problems
++
++
++def _engine_packages(root: Path) -> list[Path]:
++    base = root / "components" / "engine"
++    if not base.is_dir():
++        return []
++    return sorted(path.parent for path in base.glob("*/engine-component.json") if path.is_file())
++
++
++def _read_engine_meta(folder: Path) -> dict:
++    import json
++    try:
++        meta = json.loads((folder / "engine-component.json").read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return {}
++    return meta if isinstance(meta, dict) else {}
++
++
++def _is_sycl_meta(meta: dict) -> bool:
++    variant = str(meta.get("variant") or "").lower()
++    backend = str(meta.get("backend") or "").lower()
++    return variant == "sycl" or backend.startswith("sycl") or variant.startswith("sycl")
++
++
++def _dsv41_exes(root: Path) -> list[Path]:
++    base = root / "components" / "engine-dsv41"
++    if not base.is_dir():
++        return []
++    return sorted(path for path in base.glob("*/strata-dsv41.exe") if path.is_file())
++
++
++def gguf_files(path: Path) -> list[Path]:
++    """GGUF files at `path`. A picture reader (mmproj) is left out of a directory; a path that is only that file is returned so the caller can refuse it."""
++    path = Path(path)
++    if path.is_file():
++        return [path]
++    if not path.is_dir():
++        return []
++    files = [item for item in sorted(path.glob("*.gguf")) if not item.name.lower().startswith("mmproj")]
++    return files
++
++
++def inspect_gguf(path: Path) -> tuple[Issue | None, str | None]:
++    """(issue, architecture). issue is None when this GGUF is a model the offline entry can use.
++
++    A file that is not GGUF, not version 3, or some other architecture is refused. No conversion
++    and no download is attempted.
++    """
++    path = Path(path)
++    if not path.is_file():
++        return Issue(str(path), "missing local file. Nothing was downloaded."), None
++    if path.name.lower().startswith("mmproj"):
++        return Issue(str(path), "this is a picture reader (mmproj), not a model. Choose the model's own .gguf file. Nothing was downloaded."), None
++    try:
++        parsed = _reader().GGUFFile(path)
++    except ValueError as exc:
++        return Issue(str(path), f"{exc}. This offline entry does not convert other formats and nothing was downloaded."), None
++    arch = parsed.metadata.get("general.architecture")
++    if not isinstance(arch, str) or not arch:
++        return Issue(str(path), "GGUF has no general.architecture. Nothing was downloaded."), None
++    if arch in HELPER_ARCH:
++        return Issue(str(path), f"GGUF architecture {arch!r} is a helper table, not a model this entry runs. Nothing was downloaded."), arch
++    if arch not in MODEL_ARCH:
++        known = ", ".join(sorted(MODEL_ARCH))
++        return Issue(str(path), f"GGUF architecture {arch!r} is not handled by this offline entry (it handles {known}). Nothing was downloaded."), arch
++    return None, arch
++
++
++def engine_min_driver(root: Path) -> str | None:
++    """The NVIDIA driver floor written in the local engine manifest, if it has one."""
++    import json
++    for pkg in _engine_packages(root):
++        try:
++            meta = json.loads((pkg / "engine-component.json").read_text(encoding="utf-8"))
++        except (OSError, ValueError):
++            continue
++        floor = (meta.get("min_driver") or {}).get("nvidia")
++        if isinstance(floor, str) and floor:
++            return floor
++    return None
++
++
++def nvidia_driver_issue(floor: str, have: str | None, error: str | None) -> Issue | None:
++    """A missing or too-old NVIDIA driver. `have` is None when nvidia-smi did not answer."""
++    if error or not have:
++        return Issue("NVIDIA driver",
++                     f"the NVIDIA driver was not found ({error or 'nvidia-smi did not answer'}). "
++                     f"This package needs driver {floor} or newer. Nothing was installed.")
++    def parts(text: str) -> tuple:
++        return tuple(int(piece) for piece in text.split(".") if piece.isdigit())
++    if parts(have) < parts(floor):
++        return Issue("NVIDIA driver",
++                     f"driver {have} is older than {floor}. Nothing was installed.")
++    return None
++
++
++def _package_dict(folder: Path, meta: dict) -> dict:
++    return {
++        "folder": folder,
++        "name": folder.name,
++        "variant": str(meta.get("variant") or ""),
++        "backend": str(meta.get("backend") or ""),
++        "min_driver": str((meta.get("min_driver") or {}).get("nvidia") or ""),
++        "archs": [str(item) for item in (meta.get("archs") or [])],
++        "sycl": _is_sycl_meta(meta),
++    }
++
++
++def engine_package_facts(root: Path) -> list[dict]:
++    """Every local engine package. A SYCL package is marked and is not a CUDA choice."""
++    return [_package_dict(folder, _read_engine_meta(folder)) for folder in _engine_packages(root)]
++
++
++def cuda_packages(root: Path) -> list[dict]:
++    """Local CUDA engine packages, one dict each. Empty fields mean the manifest could not be read."""
++    return [item for item in engine_package_facts(root) if not item["sycl"]]
++
++
++def sycl_packages(root: Path) -> list[dict]:
++    """Local SYCL engine packages (Intel Arc)."""
++    return [item for item in engine_package_facts(root) if item["sycl"]]
++
++
++def choose_cuda(packages: list[dict], *, archs: list[str], driver: str | None, manual: str | None) -> tuple[dict | None, str]:
++    """Pick one local CUDA package.
++
++    When the card code is known, automatic choice prefers the higher driver floor (CUDA 13 over
++    CUDA 12) among packages whose manifest covers that card and this driver. When the card code
++    was not reported, a newer package is not guessed: the package that still includes the oldest
++    card code is used, and a package that only starts at sm_75 or newer is not chosen by itself.
++    A manual choice that fails the driver floor, or the card code when one was reported, is
++    refused. Nothing here reads whether a CUDA toolkit is installed.
++    """
++    from strata_control.engine_component import _version_key, arch_covers
++
++    def fits(package: dict, *, check_arch: bool) -> tuple[bool, str]:
++        label = package["variant"] or package["name"]
++        if check_arch and archs and package["archs"] and not arch_covers(package["archs"], archs):
++            return False, (f"{label} has code for {', '.join(package['archs'])}, this GPU is {', '.join(archs)}")
++        floor = package["min_driver"]
++        if floor:
++            if not driver:
++                return False, f"{label} needs NVIDIA driver {floor} or newer, and no driver version was reported"
++            if _version_key(driver) < _version_key(floor):
++                return False, f"{label} needs NVIDIA driver {floor} or newer, this PC has {driver}"
++        return True, ""
++
++    if manual:
++        wanted = f"cuda{manual}"
++        chosen = [item for item in packages if item["variant"] == wanted]
++        if not chosen:
++            return None, f"no local {wanted} engine package. Nothing was downloaded."
++        ok, why = fits(chosen[0], check_arch=True)
++        if not ok:
++            return None, why + ". A CUDA toolkit on the PC does not replace the driver. Nothing was installed."
++        if not archs:
++            return chosen[0], (f"CUDA {manual} was requested. The GPU compute capability was not reported, "
++                               "so the card code was not checked. The driver meets this package's floor.")
++        return chosen[0], f"CUDA {manual} was requested, and this GPU and driver meet that package's manifest."
++    ranked = sorted(packages, key=lambda item: _version_key(item["min_driver"] or "0"), reverse=True)
++    usable, reasons = [], []
++    for item in ranked:
++        ok, why = fits(item, check_arch=bool(archs))
++        if ok:
++            usable.append(item)
++        elif why:
++            reasons.append(why)
++    if not usable:
++        return None, " ".join(reasons) or "no local CUDA engine fits this PC. Nothing was installed."
++    if not archs:
++        coded = [item for item in usable if _machine_codes(item)]
++        if not coded:
++            return None, ("the GPU compute capability was not reported, and no local engine lists the card codes it can run. "
++                          "Nothing was selected.")
++        oldest = min(min(_machine_codes(item)) for item in coded)
++        if oldest >= 75:
++            return None, ("the GPU compute capability was not reported. Every local package starts at sm_75 or newer, "
++                          "so none can be chosen without knowing the card. Pass --cuda 12 or --cuda 13 when the card is known. "
++                          "Nothing was selected.")
++        wide = [item for item in coded if min(_machine_codes(item)) == oldest]
++        wide.sort(key=lambda item: _version_key(item["min_driver"] or "0"), reverse=True)
++        picked = wide[0]
++        skipped = [item["variant"] or item["name"] for item in usable if item is not picked]
++        note = (f"{picked['variant'] or picked['name']} is used because the GPU compute capability was not reported. "
++                "The package that still includes the oldest card code is used.")
++        if skipped:
++            note += " Not selected: " + ", ".join(skipped) + ". Pass --cuda 12 or --cuda 13 to choose one."
++        return picked, note
++    picked = usable[0]
++    other = " ".join(item["variant"] or item["name"] for item in usable[1:])
++    note = (f"{picked['variant'] or picked['name']} is used (driver {driver or 'unreported'}, GPU {', '.join(archs)}). "
++            "Its folder is the only engine directory put on the library path.")
++    if other:
++        note += f" Also installed and left unused: {other}."
++    return picked, note
++
++
++def write_engine_pin(components: Path, folder_name: str) -> None:
++    """Pin the chosen package the way `engine_component.resolve` already reads a manual pin."""
++    import json
++    path = components / ".updates" / "state.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        data = {}
++    if not isinstance(data, dict):
++        data = {}
++    engine = data.get("engine")
++    if not isinstance(engine, dict):
++        engine = {}
++    engine["pinned"] = folder_name
++    data["engine"] = engine
++    path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
++
++
++def preflight(root: Path, model: Path | None = None, *, port: int = 8791, driver: tuple | None = None,
++              archs: list[str] | None = None, manual: str | None = None) -> Report:
++    """Check the folder and, when given, the model. Does not start a process and does not use the network.
++
++    `driver` is (have, error) from nvidia-smi. None means this machine is not the target PC, so the
++    driver is not judged here. On Windows the installed command checks it.
++    """
++    root = Path(root)
++    kind = payload_kind(root)
++    report = Report(root=root, model=model if model is not None else root, url=f"http://127.0.0.1:{port}/")
++    for rel in runtime_files_for(root):
++        if not (root / rel).exists():
++            report.issues.append(Issue(str(root / rel), "missing local file. Nothing was downloaded."))
++    package_dirs = _engine_packages(root)
++    model_archs: set[str] = set()
++    if model is not None:
++        files = gguf_files(model)
++        if not files:
++            report.issues.append(Issue(str(model), "no local .gguf file. Nothing was downloaded."))
++        else:
++            for item in files:
++                issue, arch = inspect_gguf(item)
++                if issue is not None:
++                    report.issues.append(issue)
++                    continue
++                if arch:
++                    model_archs.add(arch)
++    if (not model_archs or "qwen4exp" in model_archs) and not package_dirs:
++        report.issues.append(Issue(
++            str(root / "components" / "engine" / "<package>" / "engine-component.json"),
++            "missing local engine package. Nothing was downloaded."))
++    if "deepseek41" in model_archs and not _dsv41_exes(root):
++        report.issues.append(Issue(
++            str(root / "components" / "engine-dsv41" / "<package>" / "strata-dsv41.exe"),
++            "missing local DeepSeek engine. This CUDA package does not contain it. Nothing was downloaded."))
++    if driver is not None or manual:
++        have, error = driver if driver is not None else (None, None)
++        facts = cuda_packages(root)
++        if driver is not None and not have:
++            sycl = sycl_packages(root)
++            if sycl and manual in (None, "sycl"):
++                report.choice_note = (
++                    "No NVIDIA driver was reported, so the local SYCL engine is used "
++                    f"({sycl[0]['name']}). This is the Intel Arc package. Nothing was downloaded.")
++                report.choice = sycl[0]  # type: ignore[attr-defined]
++            else:
++                floors = ", ".join(f"{item['variant']} needs {item['min_driver']}" for item in facts if item["min_driver"]) or "an NVIDIA driver"
++                report.issues.append(Issue("NVIDIA driver",
++                                           f"the NVIDIA driver was not found ({error or 'nvidia-smi did not answer'}). {floors}. "
++                                           "Installing the CUDA toolkit does not provide this. Nothing was installed."))
++        elif manual == "sycl":
++            sycl = sycl_packages(root)
++            if not sycl:
++                report.issues.append(Issue("SYCL engine", "no local SYCL engine package. Nothing was downloaded."))
++            else:
++                report.choice_note = f"SYCL was requested. {sycl[0]['name']} is used."
++                report.choice = sycl[0]  # type: ignore[attr-defined]
++        else:
++            chosen, note = choose_cuda(facts, archs=list(archs or []), driver=have, manual=manual)
++            if chosen is None:
++                report.issues.append(Issue("CUDA engine", note))
++            else:
++                report.choice_note = note
++                report.choice = chosen  # type: ignore[attr-defined]
++    elf = kind == "linux"
++    for folder in (root / "node", *package_dirs, *[exe.parent for exe in _dsv41_exes(root)]):
++        if folder.is_dir():
++            report.issues.extend(elf_closure_issues(folder) if elf else closure_issues(folder))
++    python_runtime = root / "control" / "python"
++    if python_runtime.is_dir():
++        report.issues.extend(elf_closure_issues(python_runtime) if elf else closure_issues(python_runtime, python_runtime=True))
++    report.argv, report.env = host_process(root, port, model)
++    return report
++
++
++def model_directory(model: Path) -> str | None:
++    """The folder the host should prepare. A file path becomes its parent; a missing path is not invented."""
++    path = Path(model)
++    if path.is_file():
++        path = path.parent
++    if not path.is_dir():
++        return None
++    return str(path.resolve())
++
++
++def host_process(root: Path, port: int, model: Path | None = None) -> tuple[list[str], dict[str, str]]:
++    """The host command and the environment that keeps it from acquiring anything.
++
++    A model path is handed to the host as STRATA_OFFLINE_MODEL (the folder). The page's install
++    uses that folder as gguf_dir, so the first preparation does not try to download weights.
++    """
++    from strata_control.offline import child_environment
++    root = Path(root)
++    node_name = "node" if payload_kind(root) == "linux" else "node.exe"
++    argv = [str(root / "node" / node_name), str(root / "host" / "server" / "index.mjs"), "--dist", str(root / "host" / "dist")]
++    env = child_environment(offline=True)
++    env.update({
++        ENV: "1",
++        "STRATA_NO_ACQUIRE": "1",
++        "STRATA_CONTROL_INSTALL": "1",
++        "STRATA_UI_MODE": "browser",
++        "STRATA_NO_BUNDLED_ENGINE": "1",
++        "STRATA_BIND": "127.0.0.1",
++        "STRATA_PORT": str(port),
++        "STRATA_DIST": str(root / "host" / "dist"),
++        "STRATA_CONTROL_DIR": str(root / "control"),
++        "STRATA_COMPONENTS_DIR": str(root / "components"),
++        "STRATA_INSTALL_DIR": str(root),
++        "PYTHONNOUSERSITE": "1",
++        "PYTHONUTF8": "1",
++        "STRATA_SETTINGS_FILE": str(root / "offline-settings.json"),
++    })
++    if model is not None:
++        folder = model_directory(model)
++        if folder:
++            env["STRATA_OFFLINE_MODEL"] = folder
++    return argv, env
++
++
++def format_report(report: Report) -> str:
++    lines = [f"Local page: {report.url}", "Open that address in a browser already on this PC. This program does not install one.", ""]
++    if report.ok:
++        lines.append("Local files this start uses:")
++        for rel in runtime_files_for(report.root):
++            lines.append(f"  {report.root / rel}")
++        for pkg in _engine_packages(report.root):
++            lines.append(f"  {pkg / 'engine-component.json'}")
++        for exe in _dsv41_exes(report.root):
++            lines.append(f"  {exe}")
++        if report.model != report.root:
++            lines.append(f"  {report.model}")
++        for item in cuda_packages(report.root):
++            floor = item["min_driver"] or "not stated"
++            arch = ", ".join(item["archs"]) or "not stated"
++            lines.append(f"  {item['name']}: variant {item['variant'] or '?'}, NVIDIA driver {floor} or newer, code {arch}")
++        if report.choice_note:
++            lines.append(report.choice_note)
++    else:
++        lines.append("Missing or unusable local files:")
++        lines.extend(f"  {issue.line()}" for issue in report.issues)
++    lines.append("")
++    lines.append("This PC must already have:")
++    lines.extend(f"  {item}" for item in host_prerequisites_for(report.root))
++    return "\n".join(lines)
++
++
++def ensure_offline_settings(root: Path) -> None:
++    """Point setup at this folder's data directory, where the bundled drafters live.
++
++    The path is written at start because the install directory is chosen by the person.
++    An existing file is kept: a later choice of data folder is not overwritten.
++    """
++    import json
++    path = Path(root) / "offline-settings.json"
++    if path.is_file():
++        return
++    data = (Path(root) / "data").resolve()
++    data.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({"data_dir": str(data)}, indent=1) + "\n", encoding="utf-8")
++
++
++def read_nvidia_driver() -> tuple[str | None, str | None]:
++    """(version, error) from nvidia-smi. Used on the target PC only."""
++    import subprocess
++    try:
++        done = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
++                              capture_output=True, text=True, timeout=20, check=False)
++    except (OSError, subprocess.SubprocessError) as exc:
++        return None, str(exc)
++    if done.returncode != 0:
++        return None, (done.stderr or done.stdout or f"exit {done.returncode}").strip()
++    line = next((item.strip() for item in done.stdout.splitlines() if item.strip()), "")
++    return (line or None), (None if line else "nvidia-smi printed no driver version")
++
++
++def begin(root: Path, model: Path | None = None, port: int = 8791, *, plan: bool = False, spawn=None,
++          check_driver: bool | None = None, driver_info: tuple | None = None, archs: list[str] | None = None,
++          manual: str | None = None):
++    """Preflight, then start the host unless `plan` is set. `spawn` is injectable for tests."""
++    if check_driver is None:
++        check_driver = os.name == "nt"
++    if check_driver and driver_info is None:
++        driver_info = read_nvidia_driver()
++    if check_driver and archs is None:
++        from strata_control.engine_component import cuda_archs_present
++        archs = cuda_archs_present()
++    report = preflight(root, model, port=port, driver=driver_info if check_driver or manual else None, archs=archs, manual=manual)
++    if not report.ok:
++        raise OfflineStop(report.issues)
++    chosen = getattr(report, "choice", None)
++    if chosen is not None:
++        from strata_control.engine_component import package_lib_dirs
++        dirs = package_lib_dirs(chosen["folder"])
++        # The chosen package stays. A CUDA toolkit, or the other engine, is removed from PATH so a
++        # later LoadLibrary cannot bind the PC's cublas instead of the one in the package.
++        if payload_kind(Path(root)) == "linux":
++            report.env["LD_LIBRARY_PATH"] = os.pathsep.join(dirs)
++        else:
++            tail = path_without_cuda_toolkit(report.env.get("PATH", ""), keep=dirs)
++            report.env["PATH"] = os.pathsep.join([*dirs, tail]).strip(os.pathsep)
++        variant = chosen["variant"]
++        if chosen.get("sycl"):
++            report.env["STRATA_OFFLINE_ENGINE"] = "sycl"
++        else:
++            report.env["STRATA_OFFLINE_CUDA"] = "13" if variant.endswith("13") else "12" if variant.endswith("12") else variant
++        if not plan:
++            write_engine_pin(Path(root) / "components", chosen["name"])
++    if plan:
++        return report
++    ensure_offline_settings(Path(root))
++    if spawn is None:
++        import subprocess
++        spawn = subprocess.Popen
++    report.proc = spawn(report.argv, env=report.env, cwd=str(Path(root) / "host"))
++    return report
++
++
++def main(argv: list[str]) -> int:
++    import argparse
++    ap = argparse.ArgumentParser(prog="strata offline", description="Start the local page from a prepared Windows folder. Downloads nothing and installs nothing.")
++    ap.add_argument("--root", required=True, help="the prepared folder (node, host, control, components, third_party)")
++    ap.add_argument("--model", default=None, help="local .gguf file or folder; the host prepares that folder and does not download weights")
++    ap.add_argument("--port", type=int, default=8791)
++    ap.add_argument("--cuda", choices=("12", "13", "sycl"), default=None, help="use this engine only: cuda 12, cuda 13, or the SYCL (Intel Arc) package")
++    ap.add_argument("--plan", action="store_true", help="check the folder and print the address; do not start")
++    args = ap.parse_args(argv)
++    model = Path(args.model) if args.model else None
++    try:
++        report = begin(Path(args.root), model, args.port, plan=True, manual=args.cuda)
++    except OfflineStop as exc:
++        print(exc, file=sys.stderr)
++        print("Nothing was downloaded and no installer was started.", file=sys.stderr)
++        return exc.exit_code
++    print(format_report(report))
++    if args.plan:
++        return 0
++    kind = payload_kind(Path(args.root))
++    if kind == "windows" and os.name != "nt":
++        print("This offline entry runs on Windows. It was not started on this system. Nothing was downloaded.", file=sys.stderr)
++        return 5
++    if kind == "linux" and os.name == "nt":
++        print("This Linux offline folder was not started. Nothing was downloaded.", file=sys.stderr)
++        return 5
++    started = begin(Path(args.root), model, args.port, plan=False, manual=args.cuda)
++    proc = started.proc
++    try:
++        return int(proc.wait())
++    except KeyboardInterrupt:
++        proc.terminate()
++        return 130
++
++
++# A tiny GGUF writer used by nothing else. Kept here so a caller can see the header shape the
++# inspector accepts, and so tests do not need numpy. Not a model converter.
++def write_header(path: Path, architecture: str) -> None:
++    """Write a GGUF v3 file with no tensors and one metadata key. For tests and local probes."""
++    def blob(text: str) -> bytes:
++        raw = text.encode()
++        return struct.pack("<Q", len(raw)) + raw
++    body = struct.pack("<I", 0x46554747) + struct.pack("<IQQ", 3, 0, 1)
++    body += blob("general.architecture") + struct.pack("<I", 8) + blob(architecture)
++    Path(path).write_bytes(body)
+diff --git a/tests/terminal/test_windows_offline.py b/tests/terminal/test_windows_offline.py
+new file mode 100644
+index 0000000..5bd0eb1
+--- /dev/null
++++ b/tests/terminal/test_windows_offline.py
+@@ -0,0 +1,590 @@
++"""The Windows offline entry: a prepared folder, no download, no installer.
++
++These tests do not start a GPU engine and do not claim a Windows run. They build a fake Windows
++folder, including paths with spaces and Chinese characters, and refuse any socket the code opens.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++import zipfile
++from pathlib import Path
++from unittest import mock
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "packaging"))
++
++import setup  # noqa: E402
++from strata_cli.launch.runner import LaunchError, Runner  # noqa: E402
++from strata_cli.launch.settings import LaunchSettings  # noqa: E402
++from strata_control import windows_offline as wo  # noqa: E402
++from strata_control.updater import UpdateError, _download  # noqa: E402
++import node_runtime  # noqa: E402
++
++
++def fake_pe(imports, delay=()):
++    """A minimal PE32+ image. Same layout as tools/test_dll_closure.py."""
++    text = bytearray()
++    va = 0x1000
++
++    def add_str(s):
++        off = len(text)
++        text.extend(s.encode() + b"\0")
++        return va + off
++
++    names = [add_str(n) for n in imports]
++    dnames = [add_str(n) for n in delay]
++    while len(text) % 8:
++        text.append(0)
++    imp_off = len(text)
++    for rva in names:
++        text.extend(struct.pack("<IIIII", 0, 0, 0, rva, 0))
++    text.extend(b"\0" * 20)
++    dly_off = len(text)
++    for rva in dnames:
++        text.extend(struct.pack("<IIIIIIII", 1, rva, 0, 0, 0, 0, 0, 0))
++    text.extend(b"\0" * 32)
++    opt_size = 112 + 16 * 8
++    pe = 0x80
++    hdr = bytearray(0x200)
++    hdr[0:2] = b"MZ"
++    struct.pack_into("<I", hdr, 0x3C, pe)
++    hdr[pe:pe + 4] = b"PE\0\0"
++    struct.pack_into("<HHIIIHH", hdr, pe + 4, 0x8664, 1, 0, 0, 0, opt_size, 0x2022)
++    opt = pe + 24
++    struct.pack_into("<H", hdr, opt, 0x20B)
++    dd = opt + 112
++    struct.pack_into("<II", hdr, dd + 8 * 1, va + imp_off, 20 * (len(names) + 1))
++    struct.pack_into("<II", hdr, dd + 8 * 13, va + dly_off, 32 * (len(dnames) + 1))
++    sec = opt + opt_size
++    hdr[sec:sec + 8] = b".idata\0\0"
++    struct.pack_into("<IIII", hdr, sec + 8, len(text), va, len(text), 0x200)
++    return bytes(hdr) + bytes(text)
++
++
++def _tree(root: Path, *, vcruntime: bool = True, engine: bool = True, llama: bool = True, dsv41: bool = False) -> None:
++    node = root / "node"
++    node.mkdir(parents=True, exist_ok=True)
++    (node / "node.exe").write_bytes(fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll"]))
++    if vcruntime:
++        (node / "vcruntime140.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++    py = root / "control" / "python"
++    py.mkdir(parents=True, exist_ok=True)
++    (py / "python.exe").write_bytes(fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll", "python312.dll"]))
++    if vcruntime:
++        (py / "vcruntime140.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++        (py / "python312.dll").write_bytes(fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll"]))
++    (root / "control" / "strata.py").write_text("print('offline')\n", encoding="utf-8")
++    pkg = root / "control" / "strata_control"
++    pkg.mkdir(exist_ok=True)
++    (pkg / "__init__.py").write_text("", encoding="utf-8")
++    (root / "host" / "server").mkdir(parents=True, exist_ok=True)
++    (root / "host" / "server" / "index.mjs").write_text("process.exit(0)\n", encoding="utf-8")
++    (root / "host" / "dist").mkdir(exist_ok=True)
++    (root / "host" / "dist" / "index.html").write_text("<p>local</p>\n", encoding="utf-8")
++    if llama:
++        llama_dir = root / "third_party" / "llama.cpp"
++        (llama_dir / "gguf-py" / "gguf").mkdir(parents=True, exist_ok=True)
++        (llama_dir / "gguf-py" / "gguf" / "__init__.py").write_text("", encoding="utf-8")
++        (llama_dir / "ggml").mkdir(exist_ok=True)
++        (llama_dir / "ggml" / "CMakeLists.txt").write_text("# marker only\n", encoding="utf-8")
++    if engine:
++        eng = root / "components" / "engine" / "0.1.55-windows-x86_64-cuda-cuda13"
++        eng.mkdir(parents=True, exist_ok=True)
++        (eng / "engine-component.json").write_text("{}\n", encoding="utf-8")
++        (eng / "strata.exe").write_bytes(fake_pe(["KERNEL32.dll", "cublas64_13.dll", "VCRUNTIME140.dll"]))
++        (eng / "cublas64_13.dll").write_bytes(fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll"]))
++        (eng / "vcruntime140.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++    if dsv41:
++        deep = root / "components" / "engine-dsv41" / "0.1.55-windows-x86_64-cuda-cuda13"
++        deep.mkdir(parents=True, exist_ok=True)
++        (deep / "strata-dsv41.exe").write_bytes(fake_pe(["KERNEL32.dll", "cublas64_13.dll"]))
++        (deep / "cublas64_13.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++
++
++def _bomb(*_a, **_k):
++    raise AssertionError("network or external tool")
++
++
++class OfflineEntry(unittest.TestCase):
++    def test_missing_engine_and_llama_do_not_touch_the_network(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp) / "模型 目录"
++            model = Path(tmp) / "我的模型" / "Qwen 本地.gguf"
++            model.parent.mkdir()
++            wo.write_header(model, "qwen4exp")
++            _tree(root, engine=False, llama=False)
++            with mock.patch("urllib.request.urlopen", _bomb), mock.patch("urllib.request.urlretrieve", _bomb):
++                report = wo.preflight(root, model)
++            text = "\n".join(issue.line() for issue in report.issues)
++            self.assertIn("engine-component.json", text)
++            self.assertIn("gguf-py", text)
++            self.assertNotIn("winget", text.lower())
++            self.assertNotIn("webview2", text.lower())
++            self.assertNotIn("https://", text)
++            with self.assertRaises(wo.OfflineStop):
++                wo.begin(root, model, spawn=_bomb, check_driver=False)
++
++    def test_complete_folder_starts_the_host_on_a_path_with_spaces_and_chinese(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp) / "离线 入口"
++            model = root / "模型 文件" / "flash next.gguf"
++            model.parent.mkdir(parents=True)
++            wo.write_header(model, "qwen4exp")
++            _tree(root)
++            seen = []
++
++            def spawn(argv, env=None, cwd=None):
++                seen.append((argv, env, cwd))
++                return mock.Mock()
++
++            with mock.patch("urllib.request.urlopen", _bomb), mock.patch("urllib.request.urlretrieve", _bomb):
++                report = wo.begin(root, model, port=8791, spawn=spawn, check_driver=False)
++            self.assertEqual(len(seen), 1)
++            argv, env, cwd = seen[0]
++            self.assertTrue(argv[0].endswith("node.exe"), argv[0])
++            self.assertIn("index.mjs", argv[1])
++            self.assertEqual(env["STRATA_OFFLINE_ENTRY"], "1")
++            self.assertEqual(env["STRATA_NO_ACQUIRE"], "1")
++            self.assertEqual(env["HF_HUB_OFFLINE"], "1")
++            self.assertEqual(env["PIP_NO_INDEX"], "1")
++            self.assertEqual(env["STRATA_BIND"], "127.0.0.1")
++            self.assertEqual(env["STRATA_OFFLINE_MODEL"], str(model.parent.resolve()))
++            self.assertEqual(report.url, "http://127.0.0.1:8791/")
++            self.assertIn("离线 入口", str(cwd))
++            for banned in ("winget", "pip", "git", "cmake"):
++                self.assertNotIn(banned, " ".join(argv))
++
++    def test_node_without_its_runtime_dll_is_named(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp) / "folder with spaces"
++            model = root / "m.gguf"
++            root.mkdir()
++            wo.write_header(model, "qwen4exp")
++            _tree(root, vcruntime=False)
++            report = wo.preflight(root, model)
++            text = "\n".join(issue.line() for issue in report.issues)
++            self.assertIn("VCRUNTIME140.dll", text)
++            self.assertIn("node.exe", text.replace("\\", "/").lower() + text)
++            self.assertFalse(report.ok)
++
++    def test_unsupported_and_non_gguf_files_are_refused(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            _tree(root)
++            other = root / "weights.safetensors"
++            other.write_bytes(b"not a gguf")
++            bad = wo.preflight(root, other)
++            self.assertTrue(any("not a GGUF" in issue.reason for issue in bad.issues))
++            unknown = root / "llama.gguf"
++            wo.write_header(unknown, "llama")
++            refused = wo.preflight(root, unknown)
++            self.assertTrue(any("llama" in issue.reason and "not handled" in issue.reason for issue in refused.issues))
++            helper = root / "ple.gguf"
++            wo.write_header(helper, "strata-ple")
++            helper_report = wo.preflight(root, helper)
++            self.assertTrue(any("helper table" in issue.reason for issue in helper_report.issues))
++
++    def test_deepseek_without_its_engine_is_refused_and_with_it_starts(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp) / "ds"
++            model = root / "ds.gguf"
++            root.mkdir()
++            wo.write_header(model, "deepseek41")
++            _tree(root, engine=False, dsv41=False)
++            missing = wo.preflight(root, model)
++            self.assertTrue(any("strata-dsv41.exe" in issue.path for issue in missing.issues))
++            _tree(root, engine=False, dsv41=True)
++            seen = []
++            with mock.patch("urllib.request.urlopen", _bomb):
++                wo.begin(root, model, spawn=lambda argv, env=None, cwd=None: seen.append(argv) or mock.Mock(), check_driver=False)
++            self.assertEqual(len(seen), 1)
++
++    def test_node_zip_closure_extracts_the_runtime_and_refuses_a_hole(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            tmp = Path(tmp)
++            good = tmp / "node.zip"
++            with zipfile.ZipFile(good, "w") as zf:
++                zf.writestr("node-v24.12.0-win-x64/node.exe", fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll"]))
++                zf.writestr("node-v24.12.0-win-x64/vcruntime140.dll", fake_pe(["KERNEL32.dll"]))
++            dest = tmp / "node"
++            written = node_runtime.extract(good, dest)
++            self.assertEqual(sorted(written), ["node.exe", "vcruntime140.dll"])
++            hole = tmp / "hole.zip"
++            with zipfile.ZipFile(hole, "w") as zf:
++                zf.writestr("node-v24.12.0-win-x64/node.exe", fake_pe(["KERNEL32.dll", "VCRUNTIME140.dll"]))
++            empty = tmp / "empty"
++            with self.assertRaises(node_runtime.NodeRuntimeError) as caught:
++                node_runtime.extract(hole, empty)
++            self.assertIn("vcruntime140.dll", str(caught.exception).lower())
++            self.assertFalse(empty.exists())
++
++    def test_an_installed_control_layout_can_preflight_without_the_repo(self):
++        """The real failure: Start-Strata.cmd loads control/strata_control/windows_offline.py, whose
++        parent is control, not the source checkout. binary_deps must be at control/packaging."""
++        with tempfile.TemporaryDirectory() as tmp:
++            install = Path(tmp) / "StrataOffline"
++            control = install / "control"
++            control.mkdir(parents=True)
++            shutil.copytree(ROOT / "strata_control", control / "strata_control",
++                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
++            packaged = control / "packaging"
++            packaged.mkdir()
++            shutil.copy2(ROOT / "packaging" / "binary_deps.py", packaged / "binary_deps.py")
++            (control / "tools").mkdir()
++            shutil.copy2(ROOT / "tools" / "gguf_reader.py", control / "tools" / "gguf_reader.py")
++            model = install / "模型" / "q.gguf"
++            model.parent.mkdir()
++            wo.write_header(model, "qwen4exp")
++            env = os.environ.copy()
++            env.pop("PYTHONPATH", None)
++            script = (
++                "import sys\n"
++                "from pathlib import Path\n"
++                "install = Path(sys.argv[1])\n"
++                "repo = Path(sys.argv[2]).resolve()\n"
++                "sys.path = [p for p in sys.path if p and Path(p).resolve() != repo and repo not in Path(p).resolve().parents]\n"
++                "sys.path.insert(0, str(install / 'control'))\n"
++                "import strata_control.windows_offline as wo\n"
++                "report = wo.preflight(install, Path(sys.argv[3]))\n"
++                "text = '\\n'.join(issue.line() for issue in report.issues)\n"
++                "if 'binary_deps' in text or 'No module named' in text:\n"
++                "    raise SystemExit(text)\n"
++                "print('preflight-import-ok')\n"
++            )
++            done = subprocess.run([sys.executable, "-c", script, str(install), str(ROOT), str(model)],
++                                  cwd=tmp, env=env, capture_output=True, text=True)
++            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
++            self.assertIn("preflight-import-ok", done.stdout)
++
++    def test_binary_deps_is_loaded_from_the_installed_control_tree(self):
++        text = (ROOT / "strata_control" / "windows_offline.py").read_text(encoding="utf-8")
++        self.assertIn("control/packaging/binary_deps.py", text)
++        self.assertIn("Nothing was downloaded.", text)
++
++    def test_fetch_scripts_use_the_closure_helper(self):
++        sh = (ROOT / "apps/desktop/scripts/fetch-node.sh").read_text(encoding="utf-8")
++        ps1 = (ROOT / "apps/desktop/scripts/fetch-node.ps1").read_text(encoding="utf-8")
++        self.assertIn("packaging/node_runtime.py", sh)
++        self.assertNotIn("unzip -q -j", sh)
++        self.assertIn("node_runtime.py", ps1)
++        self.assertNotIn("ExtractToFile", ps1)
++
++    def test_setup_download_llama_and_compiler_do_not_leave_the_machine(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            env = {"STRATA_OFFLINE_ENTRY": "1", "STRATA_INSTALL_DIR": tmp}
++            with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(setup, "_urlopen", _bomb):
++                with self.assertRaises(SystemExit):
++                    setup.get_llama_cpp()
++                dest = Path(tmp) / "missing.bin"
++                with self.assertRaises(SystemExit):
++                    setup.download("https://example.invalid/model.gguf", dest, "model")
++                self.assertFalse(dest.exists())
++                src = Path(tmp) / "local.gguf"
++                src.write_bytes(b"gguf-bytes")
++                copied = Path(tmp) / "copied.gguf"
++                setup.download(str(src), copied, "local copy")
++                self.assertEqual(copied.read_bytes(), b"gguf-bytes")
++            with mock.patch.dict(os.environ, {"STRATA_OFFLINE_ENTRY": "1"}, clear=False), \
++                    mock.patch.object(setup, "run", _bomb):
++                with self.assertRaises(SystemExit):
++                    setup.install_build_tools({"arch": 89, "archs": [89]}, True)
++
++    def test_launch_and_update_do_not_fetch_an_engine(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            with mock.patch.dict(os.environ, {"STRATA_OFFLINE_ENTRY": "1"}, clear=False), \
++                    mock.patch("urllib.request.urlopen", _bomb):
++                runner = Runner(LaunchSettings(), components_dir=tmp)
++                with self.assertRaises(LaunchError) as caught:
++                    runner.ensure_engine()
++            self.assertIn("does not download", str(caught.exception))
++            with mock.patch.dict(os.environ, {"STRATA_OFFLINE_ENTRY": "1"}, clear=False):
++                with self.assertRaises(UpdateError) as download:
++                    _download(None, "engine", "https://example.invalid/e.tar.gz", 1, "a" * 64, "the engine", None)
++                from strata_control.transfer import TransferError, download as transfer_download
++                with self.assertRaises(TransferError):
++                    transfer_download("https://example.invalid/a.bin", Path(tmp) / "a.part", size=1, sha256="ab" * 32)
++                import importlib.util
++                spec = importlib.util.spec_from_file_location("mtp_fetch", ROOT / "tools" / "mtp_fetch.py")
++                mtp = importlib.util.module_from_spec(spec)
++                spec.loader.exec_module(mtp)
++                with mock.patch.object(sys, "argv", ["mtp_fetch.py", "fetch", "--out", tmp]):
++                    with self.assertRaises(SystemExit) as mtp_exit:
++                        mtp.main()
++                self.assertIn("does not download", str(mtp_exit.exception.code))
++                with self.assertRaises(SystemExit):
++                    setup.fetch_mtp(Path(tmp) / "mtp", {})
++            self.assertIn("does not download", str(download.exception))
++
++    def test_install_job_keeps_the_offline_limit_after_it_clears_acquire(self):
++        """The real install job (tools/strata_mcp.py) is what setup runs under. It drops STRATA_NO_ACQUIRE
++        and keeps the offline flag and the PATH the host was given. setup._urlopen must still refuse https."""
++        import importlib.util
++        import json
++        loaded = importlib.util.spec_from_file_location("strata_mcp_offline_job", ROOT / "tools" / "strata_mcp.py")
++        mcp = importlib.util.module_from_spec(loaded)
++        loaded.loader.exec_module(mcp)
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            src = root / "src"
++            src.mkdir()
++            chosen = root / "engine-cuda13"
++            other = root / "engine-cuda12"
++            chosen.mkdir()
++            other.mkdir()
++            out = root / "child.json"
++            (src / "setup.py").write_text(
++                "import importlib.util, json, os, sys\n"
++                "from pathlib import Path\n"
++                f"sys.path.insert(0, {str(ROOT)!r})\n"
++                f"spec = importlib.util.spec_from_file_location('strata_setup_real', {str(ROOT / 'setup.py')!r})\n"
++                "setup = importlib.util.module_from_spec(spec)\n"
++                "spec.loader.exec_module(setup)\n"
++                "import urllib.request\n"
++                "info = {\n"
++                "    'offline': os.environ.get('STRATA_OFFLINE_ENTRY'),\n"
++                "    'acquire': os.environ.get('STRATA_NO_ACQUIRE'),\n"
++                "    'path0': os.environ.get('PATH', '').split(os.pathsep)[0],\n"
++                "    'path': os.environ.get('PATH', ''),\n"
++                "}\n"
++                "def boom(*_a, **_k):\n"
++                "    info['opened'] = True\n"
++                "    raise AssertionError('urlopen')\n"
++                "urllib.request.urlopen = boom\n"
++                "try:\n"
++                "    setup._urlopen(urllib.request.Request('https://example.invalid/model.gguf'))\n"
++                "except SystemExit as exc:\n"
++                "    info['exit'] = exc.code\n"
++                f"Path({str(out)!r}).write_text(json.dumps(info), encoding='utf-8')\n"
++                "raise SystemExit(0)\n",
++                encoding="utf-8",
++            )
++            job = root / "job.json"
++            job.write_text(json.dumps({
++                "root": str(root), "result": str(root / "result.json"), "python": sys.executable,
++                "src": str(src), "args": [], "control": True, "job": "offline-job",
++            }), encoding="utf-8")
++            saved = {key: os.environ.get(key) for key in ("STRATA_OFFLINE_ENTRY", "STRATA_NO_ACQUIRE", "PATH")}
++            os.environ["STRATA_OFFLINE_ENTRY"] = "1"
++            os.environ["STRATA_NO_ACQUIRE"] = "1"
++            os.environ["PATH"] = str(chosen) + os.pathsep + "/usr/bin"
++            try:
++                code = mcp.install_job(str(job))
++            finally:
++                for key, value in saved.items():
++                    if value is None:
++                        os.environ.pop(key, None)
++                    else:
++                        os.environ[key] = value
++            self.assertEqual(code, 0, (root / "result.json").read_text(encoding="utf-8") if (root / "result.json").exists() else "no result")
++            info = json.loads(out.read_text(encoding="utf-8"))
++            self.assertEqual(info["offline"], "1")
++            self.assertIsNone(info["acquire"])
++            self.assertEqual(info["path0"], str(chosen))
++            self.assertNotIn(str(other), info["path"])
++            self.assertNotIn("opened", info)
++            self.assertEqual(info["exit"], 1)
++
++    def test_python_dll_check_matches_the_loader_and_ignores_an_unused_directory(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            (root / "python.exe").write_bytes(fake_pe(["KERNEL32.dll", "python312.dll"]))
++            (root / "python312.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++            package = root / "Lib" / "site-packages" / "numpy"
++            core = package / "_core"
++            libs = root / "Lib" / "site-packages" / "numpy.libs"
++            core.mkdir(parents=True)
++            libs.mkdir()
++            (libs / "libscipy_openblas.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++            (package / "__init__.py").write_text(
++                "import os\n"
++                "libs_dir = os.path.join(os.path.dirname(__file__), os.pardir, 'numpy.libs')\n"
++                "os.add_dll_directory(libs_dir)\n",
++                encoding="utf-8",
++            )
++            (core / "_multiarray.pyd").write_bytes(fake_pe(["python312.dll", "libscipy_openblas.dll"]))
++            unused = root / "unused"
++            unused.mkdir()
++            (unused / "secret.dll").write_bytes(fake_pe(["KERNEL32.dll"]))
++            (root / "plugin.pyd").write_bytes(fake_pe(["secret.dll"]))
++            text = "\n".join(issue.line() for issue in wo.closure_issues(root, python_runtime=True))
++            self.assertNotIn("_multiarray.pyd", text)
++            self.assertIn("secret.dll", text)
++            self.assertIn("plugin.pyd", text)
++
++    def test_engine_child_path_drops_a_cuda_toolkit_under_the_offline_entry(self):
++        import serve.server as server
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            engine = root / "engine"
++            toolkit = root / "toolkit"
++            engine.mkdir()
++            toolkit.mkdir()
++            (engine / "cublas64_13.dll").write_bytes(b"package")
++            (toolkit / "cublas64_12.dll").write_bytes(b"toolkit")
++            inherited = os.pathsep.join([str(engine), str(toolkit), "/usr/bin"])
++            with mock.patch.dict(os.environ, {"PATH": inherited, "STRATA_OFFLINE_ENTRY": "1"}):
++                env = server.child_env({"lib_dirs": [str(engine)]}, offline=False)
++            parts = env["PATH"].split(os.pathsep)
++            self.assertIn(str(engine), parts)
++            self.assertNotIn(str(toolkit), parts)
++            self.assertIn("/usr/bin", parts)
++
++    def test_the_engine_server_treats_the_offline_entry_as_offline_without_the_flag(self):
++        import serve.server as server
++        self.assertFalse(server.offline_requested(False))
++        self.assertTrue(server.offline_requested(True))
++        with mock.patch.dict(os.environ, {"STRATA_OFFLINE_ENTRY": "1"}):
++            self.assertTrue(server.offline_requested(False))
++
++    def test_plan_command_prints_the_address_and_a_missing_folder_exits_5(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp) / "ready"
++            model = root / "m.gguf"
++            root.mkdir()
++            wo.write_header(model, "qwen4exp")
++            _tree(root)
++            with mock.patch("sys.stdout") as out, \
++                    mock.patch.object(wo, "read_nvidia_driver", return_value=("581.80", None)), \
++                    mock.patch("strata_control.engine_component.cuda_archs_present", return_value=["sm_89"]):
++                code = wo.main(["--root", str(root), "--model", str(model), "--plan"])
++            self.assertEqual(code, 0)
++            printed = "".join(call.args[0] for call in out.write.call_args_list)
++            self.assertIn("http://127.0.0.1:8791/", printed)
++            self.assertIn("Windows 10 or Windows 11", printed)
++            empty = Path(tmp) / "empty"
++            empty.mkdir()
++            code = wo.main(["--root", str(empty), "--model", str(model), "--plan"])
++            self.assertEqual(code, 5)
++
++
++def _manifest(folder: Path, variant: str, floor: str, archs: list[str]) -> dict:
++    folder.mkdir(parents=True, exist_ok=True)
++    meta = {"variant": variant, "min_driver": {"nvidia": floor}, "archs": archs, "version": "0.1.55", "backend": "cuda", "platform": "windows-x86_64"}
++    (folder / "engine-component.json").write_text(__import__("json").dumps(meta), encoding="utf-8")
++    (folder / "strata.exe").write_bytes(fake_pe(["KERNEL32.dll"]))
++    return meta
++
++
++class CudaChoice(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.cuda12 = self.root / "components" / "engine" / "0.1.55-windows-x86_64-cuda-cuda12"
++        self.cuda13 = self.root / "components" / "engine" / "0.1.55-windows-x86_64-cuda-cuda13"
++        _manifest(self.cuda12, "cuda12", "576.02", ["sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "compute_89"])
++        _manifest(self.cuda13, "cuda13", "580.65", ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"])
++        self.packages = wo.cuda_packages(self.root)
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_cuda13_is_preferred_only_when_the_driver_and_gpu_allow_it(self):
++        chosen, note = wo.choose_cuda(self.packages, archs=["sm_89"], driver="581.80", manual=None)
++        self.assertEqual(chosen["variant"], "cuda13")
++        self.assertIn("cuda12", note)
++        self.assertNotIn(str(self.cuda12), note)
++
++    def test_an_older_driver_keeps_cuda12_even_if_a_newer_toolkit_could_be_present(self):
++        chosen, note = wo.choose_cuda(self.packages, archs=["sm_86"], driver="576.02", manual=None)
++        self.assertEqual(chosen["variant"], "cuda12", note)
++        refused, why = wo.choose_cuda(self.packages, archs=["sm_86"], driver="576.02", manual="13")
++        self.assertIsNone(refused)
++        self.assertIn("580.65", why)
++        self.assertIn("toolkit", why)
++
++    def test_pascal_does_not_get_cuda13_and_blackwell_prefers_cuda13(self):
++        pascal, _ = wo.choose_cuda(self.packages, archs=["sm_61"], driver="595.00", manual=None)
++        self.assertEqual(pascal["variant"], "cuda12")
++        blackwell, _ = wo.choose_cuda(self.packages, archs=["sm_120"], driver="580.65", manual=None)
++        self.assertEqual(blackwell["variant"], "cuda13")
++
++    def test_the_chosen_engine_directory_is_the_only_one_put_on_the_path(self):
++        from strata_control.engine_component import package_lib_dirs
++        _tree(self.root)
++        _manifest(self.cuda12, "cuda12", "576.02", ["sm_60", "sm_86", "sm_89", "compute_89"])
++        _manifest(self.cuda13, "cuda13", "580.65", ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"])
++        report = wo.preflight(self.root, driver=("581.80", None), archs=["sm_89"])
++        self.assertTrue(report.ok, [issue.line() for issue in report.issues])
++        self.assertEqual(report.choice["variant"], "cuda13")
++        dirs = package_lib_dirs(report.choice["folder"])
++        self.assertIn(str(self.cuda13), dirs)
++        self.assertNotIn(str(self.cuda12), dirs)
++        model = self.root / "模型 目录" / "qwen.gguf"
++        model.parent.mkdir()
++        wo.write_header(model, "qwen4exp")
++        seen = {}
++
++        def spawn(argv, env=None, cwd=None):
++            seen["argv"], seen["env"], seen["cwd"] = argv, env, cwd
++            return mock.Mock()
++
++        started = wo.begin(self.root, model, check_driver=True, driver_info=("581.80", None), archs=["sm_89"], spawn=spawn)
++        self.assertEqual(started.env["PATH"].split(os.pathsep)[0], str(self.cuda13))
++        self.assertNotIn(str(self.cuda12), started.env["PATH"])
++        self.assertEqual(started.env["STRATA_OFFLINE_CUDA"], "13")
++        self.assertEqual(seen["env"]["STRATA_OFFLINE_MODEL"], str(model.parent.resolve()))
++        self.assertEqual(seen["env"]["STRATA_OFFLINE_ENTRY"], "1")
++        self.assertEqual(seen["env"]["PATH"].split(os.pathsep)[0], str(self.cuda13))
++
++    def test_unknown_compute_capability_keeps_cuda12_and_does_not_guess_cuda13(self):
++        chosen, note = wo.choose_cuda(self.packages, archs=[], driver="581.80", manual=None)
++        self.assertEqual(chosen["variant"], "cuda12", note)
++        self.assertIn("cuda13", note)
++        only13 = [item for item in self.packages if item["variant"] == "cuda13"]
++        refused, why = wo.choose_cuda(only13, archs=[], driver="581.80", manual=None)
++        self.assertIsNone(refused, why)
++        self.assertIn("sm_75", why)
++        self.assertIn("Nothing was selected", why)
++        manual, told = wo.choose_cuda(self.packages, archs=[], driver="581.80", manual="13")
++        self.assertEqual(manual["variant"], "cuda13")
++        self.assertIn("not reported", told)
++        known, known_note = wo.choose_cuda(self.packages, archs=["sm_89"], driver="581.80", manual=None)
++        self.assertEqual(known["variant"], "cuda13", known_note)
++
++    def test_the_spawned_path_drops_a_cuda_toolkit_directory(self):
++        toolkit = self.root / "toolkit" / "bin"
++        toolkit.mkdir(parents=True)
++        (toolkit / "cublas64_13.dll").write_bytes(b"toolkit")
++        (self.cuda12 / "cudart64_12.dll").write_bytes(b"other-engine")
++        model = self.root / "模型 目录" / "qwen.gguf"
++        model.parent.mkdir(exist_ok=True)
++        wo.write_header(model, "qwen4exp")
++        _tree(self.root)
++        _manifest(self.cuda12, "cuda12", "576.02", ["sm_60", "sm_86", "sm_89", "compute_89"])
++        _manifest(self.cuda13, "cuda13", "580.65", ["sm_75", "sm_86", "sm_89", "sm_120", "compute_120"])
++        (self.cuda12 / "cudart64_12.dll").write_bytes(b"other-engine")
++        inherited = os.pathsep.join([str(toolkit), str(self.cuda12), "/usr/bin"])
++        seen = {}
++
++        def spawn(argv, env=None, cwd=None):
++            seen["env"] = env
++            return mock.Mock()
++
++        with mock.patch.dict(os.environ, {"PATH": inherited}):
++            started = wo.begin(self.root, model, check_driver=True, driver_info=("581.80", None), archs=["sm_120"], spawn=spawn)
++        path = started.env["PATH"].split(os.pathsep)
++        self.assertEqual(path[0], str(self.cuda13))
++        self.assertNotIn(str(toolkit), path)
++        self.assertNotIn(str(self.cuda12), path)
++        self.assertIn("/usr/bin", path)
++        self.assertEqual(seen["env"]["STRATA_OFFLINE_MODEL"], str(model.parent.resolve()))
++        self.assertEqual(seen["env"]["STRATA_OFFLINE_ENTRY"], "1")
++
++    def test_a_missing_driver_is_an_error_and_does_not_assume_cuda13(self):
++        report = wo.preflight(self.root, driver=(None, "nvidia-smi was not found"))
++        self.assertFalse(report.ok)
++        text = "\n".join(issue.line() for issue in report.issues)
++        self.assertIn("580.65", text)
++        self.assertIn("576.02", text)
++        self.assertIn("toolkit", text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/mtp_fetch.py b/tools/mtp_fetch.py
+index 8968dfa..bd46d3e 100644
+--- a/tools/mtp_fetch.py
++++ b/tools/mtp_fetch.py
+@@ -478,6 +478,8 @@ def main():
+     ap.add_argument("--out", required=True)
+     ap.add_argument("--only")
+     a = ap.parse_args()
++    if a.cmd != "verify" and os.environ.get("STRATA_OFFLINE_ENTRY") == "1":
++        sys.exit(f"missing local directory {a.out}. The offline entry does not download the draft layer. Nothing was fetched.")
+     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
+         bad = verify(a.out)
+         for name in bad:

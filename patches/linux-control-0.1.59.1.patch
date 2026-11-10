@@ -1,0 +1,668 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index eee8ff0be91..94d8430a28d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,7 +10,7 @@
+ # building for a pre-Ampere arch would produce a binary that runs and is wrong about its own performance, which is
+ # the worst of both outcomes.
+ cmake_minimum_required(VERSION 3.24)
+-project(strata VERSION 0.1.59 LANGUAGES CXX)
++project(strata VERSION 0.1.59.1 LANGUAGES CXX)
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name>: the model shape the kernels are compiled for (default flash_next, no flag added)
+ # The build is cut by backend (cleanup 5.4): each file below only DEFINES macros (strata_<part>()), which run here, in this scope, at the place their
+ # block used to be - so this file reads in the order the old single CMakeLists.txt evaluated.
+diff --git a/apps/host/tests/arcfix-updated-control.test.mjs b/apps/host/tests/arcfix-updated-control.test.mjs
+new file mode 100644
+index 00000000000..9cb1dfdc5e4
+--- /dev/null
++++ b/apps/host/tests/arcfix-updated-control.test.mjs
+@@ -0,0 +1,88 @@
++import './helpers/isolate-profile.mjs';   // a test run never writes the owner's real Strata profile
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir as osTmpdir } from 'node:os';
++import { bundledPython, createControl, findControl } from '../server/control-runtime.mjs';
++import { createNativeControl } from '../server/native-control.mjs';
++
++// ARCFIX (0.2.13): a Control-only feed update (`strata update`, or Settings > Updates > Strata) writes <components>/control/active.json.
++// The packaged app must then run the model setup (tools/strata_mcp.py and the setup.py it starts) from THAT Control, not from the bundled one.
++const isWin = process.platform === 'win32';
++const tmp = () => realpathSync(osTmpdir());
++
++function controlDir(parent, name, version) {
++  const dir = join(parent, name);
++  mkdirSync(join(dir, 'python', ...(isWin ? [] : ['bin'])), { recursive: true });
++  mkdirSync(join(dir, 'strata_control'), { recursive: true });
++  mkdirSync(join(dir, 'tools'), { recursive: true });
++  mkdirSync(join(dir, 'serve'), { recursive: true });
++  writeFileSync(bundledPython(dir), 'x');
++  writeFileSync(join(dir, 'strata.py'), '# cli');
++  writeFileSync(join(dir, 'tools', 'strata_mcp.py'), '# mcp');
++  writeFileSync(join(dir, 'setup.py'), '# setup');
++  writeFileSync(join(dir, 'serve', 'server.py'), 'port\nparallel\n/v1/responses');
++  writeFileSync(join(dir, 'BUNDLE.json'), JSON.stringify({ version }));
++  return dir;
++}
++
++function fixture() {
++  const root = mkdtempSync(join(tmp(), 'strata-arcfix-'));
++  const install = join(root, 'install');                          // the AppImage's / installer's folder: <install>/host + <install>/control
++  mkdirSync(join(install, 'host'), { recursive: true });
++  const bundled = controlDir(install, 'control', '0.1.59');
++  const components = join(root, 'components');
++  mkdirSync(join(components, 'control'), { recursive: true });
++  const updated = controlDir(join(components, 'control'), '0.1.59.1', '0.1.59.1');
++  writeFileSync(join(components, 'control', 'active.json'), JSON.stringify({ version: '0.1.59.1', folder: '0.1.59.1', sha256: 'x' }));
++  return { root, install, bundled, components, updated, hostDir: join(install, 'host') };
++}
++
++test('a four-part Control (0.1.59.1) from the feed beats the bundled 0.1.59, whether the shell names the bundled one or it sits beside the host', () => {
++  const f = fixture();
++  try {
++    // the Tauri shell sets STRATA_CONTROL_DIR to the bundled folder (apps/desktop/src-tauri/src/main.rs apply_runtime_policy)
++    const viaShell = findControl({ env: { STRATA_CONTROL_DIR: f.bundled }, hostDir: f.hostDir, components: f.components });
++    assert.equal(viaShell.dir, f.updated);
++    assert.equal(viaShell.bundle.version, '0.1.59.1');
++    assert.equal(findControl({ env: {}, hostDir: f.hostDir, components: f.components }).dir, f.updated);
++    // the same Control, the same version: the bundled one stays (a tie goes to the first), so a feed that offers 0.1.59 again changes nothing
++    writeFileSync(join(f.updated, 'BUNDLE.json'), JSON.stringify({ version: '0.1.59' }));
++    writeFileSync(join(f.components, 'control', 'active.json'), JSON.stringify({ version: '0.1.59', folder: '0.1.59.1' }));
++    assert.equal(findControl({ env: { STRATA_CONTROL_DIR: f.bundled }, hostDir: f.hostDir, components: f.components }).dir, f.bundled);
++  } finally { rmSync(f.root, { recursive: true, force: true }); }
++});
++
++test('the model setup of the packaged app runs from the updated Control: strata_mcp.py (and with it --src, the folder setup.py is started from) is the updated one', async () => {
++  const f = fixture();
++  try {
++    const found = findControl({ env: { STRATA_CONTROL_DIR: f.bundled }, hostDir: f.hostDir, components: f.components });
++    const spawned = [];
++    const spawnProcess = (command, args, options) => {
++      spawned.push({ command, args, options });
++      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.exitCode = null;
++      child.kill = () => true;
++      child.stdin = { write(line) {
++        const message = JSON.parse(line); if (!message.id) return;
++        const result = message.method === 'tools/list' ? { tools: [{ name: 'strata_status' }] } : { protocolVersion: '2024-11-05' };
++        queueMicrotask(() => child.stdout.emit('data', Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\n')));
++      } };
++      return child;
++    };
++    const data = join(f.root, 'data');
++    const control = { ...createControl({ control: found, run: async () => ({}) }),
++      async installedModels() { return { install_dir: f.root, models: [] }; },
++      async engine() { return { usable: true, backend: 'sycl', engine: { version: '0.1.59', platform: 'linux-x86_64', backend: 'sycl', exe: '/e/strata', root: '/e' } }; } };
++    const native = createNativeControl({ control, directory: data, spawnProcess, fetcher: async () => Response.json({}) });
++    try { await native.refresh(true); } finally { await native.close(); }
++    const installer = spawned.find(s => String(s.args[0]).endsWith('strata_mcp.py'));
++    assert.ok(installer, 'the host started the installer process');
++    assert.equal(installer.command, bundledPython(f.updated));
++    assert.equal(installer.args[0], join(f.updated, 'tools', 'strata_mcp.py'));
++    assert.equal(installer.args[installer.args.indexOf('--src') + 1], f.updated);
++    assert.equal(installer.options.cwd, f.updated);
++    assert.equal(installer.options.env.STRATA_CONTROL_DIR, f.updated);
++  } finally { rmSync(f.root, { recursive: true, force: true }); }
++});
+diff --git a/setup.py b/setup.py
+index cda35802c0c..b74add8aada 100644
+--- a/setup.py
++++ b/setup.py
+@@ -8284,6 +8284,75 @@ def sycl_setup(argv) -> int:
+     return subprocess.call([sys.executable, str(script), *rest])
+ 
+ 
++def intel_control_setup(a) -> int:
++    """`--backend sycl` in the app's CONTROL mode (tools/strata_mcp.py passes it for an Intel Arc PC): what the Terminal does for an Arc
++    (strata_cli/launch/runner.py adopt_prepared_files): the pack from the model's GGUF files (`--prepare-pack`'s step), then the run config
++    (strata_cli/launch/adopt.py), the engine named as the component. Nothing is downloaded but gguf-py's small helper, nothing is compiled; Intel
++    cards do not download models, so the files must be on the computer (--gguf-dir, or <data folder>/models/<tag>). The older `--backend sycl`
++    (a source build with oneAPI, sycl/setup_intel.py) is sycl_setup(), for a checkout; the app's bundle has no sycl/ folder."""
++    from strata_cli.launch import adopt
++    from strata_control import intel_app
++    say("Strata on an Intel Arc card (the SYCL engine)")
++    step(1, "checking this computer")
++    if not intel_app.supported_here():
++        fail("the Intel Arc engine runs on Linux only", "there is no Windows or Mac Intel engine yet")
++    family = a.family or "qwen"
++    if family not in adopt.FAMILIES or family not in FAMILIES:
++        fail(f"cannot set up {family} for an Intel Arc card", "choose a Qwen3.8-Flash-Next, Swift, Coder, Gyro or Unsloth size")
++    fam, model = FAMILIES[family], a.model
++    if not model:
++        fail("an Intel Arc setup needs --model, e.g. --model Q2_0")
++    data, _elsewhere = data_folder_for(a)
++    tag = fam["tag"] + model
++    if a.gguf_dir:
++        model_dir = Path(a.gguf_dir)
++    else:
++        model_dir = (Path(a.models_dir) if a.models_dir else data / "models") / tag
++    if model_dir.is_file():
++        model_dir = model_dir.parent
++    shards = intel_app.model_files_in(model_dir, family)
++    if not shards:
++        fail(intel_app.NO_DOWNLOAD)
++    ok(f"model files: {model_dir} ({len(shards)} file{'s' if len(shards) != 1 else ''})")
++    cards = intel_app.arc_cards()
++    vram = max((float(c.get("vram_gb") or 0) for c in cards), default=0.0)
++    ok("graphics card: " + (", ".join(f"{c['name']} ({c['vram_gb']:g} GB)" for c in cards) or "an Intel Arc"))
++    if a.check:
++        return 0
++    step(2, "preparing the model for this graphics card")
++    pack = data / "packs" / tag.lower()
++    if not ((pack / "experts.bin").exists() or ((pack / "index.txt").exists() and (pack / "tokenizer" / "vocab.json").exists())):
++        a.gguf_dir, a.prepare_pack = str(model_dir), str(pack)
++        rc = prepare_pack_only(a)
++        if rc:
++            return rc
++    else:
++        ok(f"model already prepared: {pack}")
++    step(3, "writing the run settings")
++    notes: list = []
++    cfg, problems = adopt.plan(family=family, model=model, model_dir=model_dir, data_dir=data, src=ROOT, context=a.context or 32768, kv=a.kv,
++                               model_name=f"{fam.get('name', family)}-{model.lower()}", family_def=fam, log=home() / f"strata-{tag.lower()}.log",
++                               backend="sycl", vram_gb=vram, notes=notes, pack_name=tag.lower())
++    if cfg is None:
++        fail("Strata cannot start this model on the Intel Arc card yet: " + "; ".join(problems))
++    if a.port:
++        cfg["port"] = a.port
++    if a.host:
++        cfg["host"] = a.host
++    if a.api_key:
++        cfg["api_key"] = a.api_key
++    if a.browser is not None:
++        cfg["open_browser"] = a.browser
++    cfg_path = home() / f"strata-{tag.lower()}.json"
++    write_setup_config(cfg_path, cfg)
++    for n in notes:
++        say("  " + n)
++    ok(f"run settings: {cfg_path.name}")
++    say()
++    say("All set.")
++    return 0
++
++
+ def control_engine_step(gpu, vision):
+     """Step 4 in the app: the engine is the component folder's package (strata_control/engine_component.py), found if it is
+     there and never fetched or built. A model can be downloaded and prepared before the engine is installed; the run config
+@@ -10214,7 +10283,9 @@ def main() -> int:
+         if a.family in MULTI_FILE_FAMILIES:            # DeepSeek-V4.1-Flash: its own engine package, the generic DeepSeek install
+             return mac_dsv41_setup(a)
+         return mac_control_setup(a)
+-    if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
++    if a.backend == "sycl":                            # Intel Arc: the app / Terminal's installer mode prepares the files and writes the config; a checkout builds from source
++        if CONTROL:
++            return intel_control_setup(a)
+         return sycl_setup(sys.argv[1:])
+     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
+         ap.error("--resident-budget-gib takes a number of GiB above 0, e.g. --resident-budget-gib 32")
+diff --git a/strata_cli/__init__.py b/strata_cli/__init__.py
+index bf2c95aa11e..f6b04573592 100644
+--- a/strata_cli/__init__.py
++++ b/strata_cli/__init__.py
+@@ -7,7 +7,7 @@
+ 
+ #: The version people are told: the Strata app's own (apps/desktop/src-tauri/Cargo.toml `version`; tests/terminal/test_tuiqa_version.py keeps the
+ #: two equal, except for a Terminal-only release such as 0.2.3.1 or 0.2.4, whose app stays 0.2.3). `version()` below is the files' build number, which the engine-compatibility checks compare, so it stays numeric.
+-PRODUCT_VERSION = "0.2.13"
++PRODUCT_VERSION = "0.2.13.1"
+ 
+ 
+ def version() -> str:
+diff --git a/strata_control/intel_app.py b/strata_control/intel_app.py
+new file mode 100644
+index 00000000000..c1cc736d017
+--- /dev/null
++++ b/strata_control/intel_app.py
+@@ -0,0 +1,71 @@
++"""The Intel Arc card in the desktop app (the model setup of Strata Control, tools/strata_mcp.py and setup.py in their CONTROL mode).
++
++The Terminal (`strata launch`) sets an Arc up in two steps (strata_cli/launch/runner.py adopt_prepared_files): `setup.py --prepare-pack` makes the pack
++from the model's GGUF files, and strata_cli/launch/adopt.py writes the run config, with the engine named as the component (`component:strata-engine`).
++Intel cards do not download models: the files must be on the computer. The app's install job did neither step: it ran setup.py's normal NVIDIA / AMD
++path, which stops with "no NVIDIA GPU found (nvidia-smi did not answer)" (0.2.13 and 0.2.12, found by QAGUI-LIN on an Arc A750).
++
++This module is the part both tools/strata_mcp.py (which engine the install is for; the card list) and setup.py (`--backend sycl` in CONTROL mode)
++share. NVIDIA and AMD are never touched: an Arc is added to the card list only when this PC has no usable NVIDIA or AMD card, and the engine
++Strata Control itself would pick (strata_control/engine_component.py detect_backend) is the Intel one.
++"""
++
++from __future__ import annotations
++
++import sys
++
++#: What the install says when an Arc card is chosen and the model's files are not on the computer (the Terminal's own sentence, "Intel cards do not
++#: download models yet", in the app's words: the picker's entry is "Use your own GGUF…").
++NO_DOWNLOAD = ("Strata can't download models for an Intel Arc card yet. Choose \"Use your own GGUF…\" and pick the folder that holds the model's "
++               ".gguf files; Strata prepares them for this card.")
++
++#: The families the run config can be written for (strata_cli/launch/adopt.py FAMILIES): the Qwen3.8-Flash-Next sizes, Swift, Coder, Gyro and Unsloth's sets.
++def families() -> tuple:
++    from strata_cli.launch import adopt
++    return tuple(adopt.FAMILIES)
++
++
++def model_files_in(folder, family: str) -> list:
++    """The model's GGUF files in `folder` when the whole set is there (every shard; Gyro: its one file), else []."""
++    from pathlib import Path
++    from strata_cli.launch import adopt
++    folder = Path(folder)
++    if not folder.is_dir():
++        return []
++    return adopt.find_single(folder) if family == "gyro" else adopt.find_shards(folder)
++
++
++def supported_here(platform: str | None = None) -> bool:
++    """Intel Arc engines ship for Linux x86_64 only (no Windows or Mac package in the feed)."""
++    return (platform or sys.platform).startswith("linux")
++
++
++def arc_cards(root: str = "/sys/class/drm") -> list[dict]:
++    """The Intel Arc cards in this Linux computer, as the Terminal lists them (strata_cli/launch/catalog.py intel_arc_cards): vendor "intel", name,
++    vram_gb (the card's own, from its PCI id), usable True."""
++    from strata_cli.launch.catalog import intel_arc_cards
++    return intel_arc_cards(root)
++
++
++def engine_is_intel() -> bool:
++    """Is the engine this computer's Strata Control would use the Intel one (SYCL)? The same decision the engine download makes (strata_control/
++    engine_component.py detect_backend: STRATA_ENGINE_BACKEND, the saved choice, then the cards)."""
++    from strata_control import engine_component as ec
++    return ec.detect_backend()[0] == "sycl"
++
++
++def cards_to_add(nvidia: list[dict], amd: list[dict], *, platform: str | None = None, cards=None, intel_engine=None) -> list[dict]:
++    """The Arc cards to put in the hardware report beside `nvidia` and `amd`: none when either make has a usable card (those PCs are exactly what they
++    were), none off Linux, none when the engine is not the Intel one. Never raises: a probe that fails adds nothing."""
++    if not supported_here(platform):
++        return []
++    if any(g.get("usable") for g in nvidia) or any(g.get("usable") for g in amd):
++        return []
++    cards, intel_engine = cards or arc_cards, intel_engine or engine_is_intel
++    try:
++        found = cards()
++        if not found or not intel_engine():
++            return []
++    except Exception:                                          # noqa: BLE001 - the hardware page never breaks over this
++        return []
++    return [dict(c) for c in found]
+diff --git a/tests/terminal/test_intel_app_install.py b/tests/terminal/test_intel_app_install.py
+new file mode 100644
+index 00000000000..57b9f935179
+--- /dev/null
++++ b/tests/terminal/test_intel_app_install.py
+@@ -0,0 +1,259 @@
++"""ARCFIX (0.2.13): the app's model setup on an Intel Arc card (Linux, the SYCL engine).
++
++Found by QAGUI-LIN on an Arc A750: the app's install job ran setup.py with no `--backend`, so setup's NVIDIA / AMD path stopped with "no NVIDIA GPU found
++(nvidia-smi did not answer)". tools/strata_mcp.py now picks `sycl` for an Intel PC and passes `--backend sycl`; setup.py's CONTROL mode answers that with the
++Terminal's own two steps (the pack, then the run config of strata_cli/launch/adopt.py). NVIDIA and AMD are what they were. Offline: nothing runs but Python."""
++
++from __future__ import annotations
++
++import json
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest import mock
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "tools"))
++import setup  # noqa: E402
++import strata_mcp as M  # noqa: E402
++from strata_control import intel_app  # noqa: E402
++
++A750 = {"vendor": "intel", "name": "Intel Arc A750", "vram_gb": 8.0, "usable": True, "index": 0}
++NVIDIA = {"vendor": "nvidia", "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "usable": True, "index": 0, "arch": "120"}
++AMD = {"vendor": "amd", "name": "AMD Radeon RX 9070 XT", "vram_gb": 15.9, "usable": True, "index": 0, "arch": "gfx1201"}
++AMD_IGPU = {"vendor": "amd", "name": "AMD Radeon Graphics", "vram_gb": 0.5, "usable": False, "index": 0, "arch": "gfx1036", "uma": True}
++
++
++def shards(folder: Path, model: str = "Q2_0", family: str = "qwen") -> list[Path]:
++    fam = setup.FAMILIES[family]
++    folder.mkdir(parents=True, exist_ok=True)
++    out = [folder / setup.model_file(fam, model, i) for i in range(1, setup.model_shards(fam, model) + 1)]
++    for p in out:
++        p.write_bytes(b"x")
++    return out
++
++
++class CardList(unittest.TestCase):
++    def add(self, nvidia, amd, *, platform="linux", cards=(A750,), intel=True):
++        return intel_app.cards_to_add(nvidia, amd, platform=platform, cards=lambda: [dict(c) for c in cards], intel_engine=lambda: intel)
++
++    def test_an_arc_only_pc_gets_its_card(self):
++        self.assertEqual([c["name"] for c in self.add([], [])], ["Intel Arc A750"])
++        self.assertEqual([c["name"] for c in self.add([], [AMD_IGPU])], ["Intel Arc A750"], "an integrated Radeon that is not usable does not hide the Arc")
++
++    def test_nvidia_and_amd_pcs_are_what_they_were(self):
++        self.assertEqual(self.add([NVIDIA], []), [])
++        self.assertEqual(self.add([], [AMD]), [])
++        self.assertEqual(self.add([NVIDIA], [AMD]), [])
++
++    def test_only_linux_and_only_when_the_engine_is_the_intel_one(self):
++        self.assertEqual(self.add([], [], platform="win32"), [])           # no Windows Intel engine in the feed
++        self.assertEqual(self.add([], [], platform="darwin"), [])
++        self.assertEqual(self.add([], [], intel=False), [])                # the engine Control would pick is not SYCL (STRATA_ENGINE_BACKEND, a saved choice)
++        self.assertEqual(self.add([], [], cards=()), [])
++
++    def test_a_probe_that_fails_adds_nothing(self):
++        def boom():
++            raise OSError("no sysfs")
++        self.assertEqual(intel_app.cards_to_add([], [], platform="linux", cards=boom, intel_engine=lambda: True), [])
++        self.assertEqual(intel_app.cards_to_add([], [], platform="linux", cards=lambda: [A750], intel_engine=boom), [])
++
++    def test_the_hardware_report_carries_the_arc_with_its_own_id(self):
++        s = M.Strata(ROOT)
++        S = s.setup_module()
++        with mock.patch.object(M.sys, "platform", "linux"), mock.patch.object(M, "WIN", False), \
++                mock.patch.object(S, "gpus", lambda: []), mock.patch.object(S, "amd_gpus", lambda: []), \
++                mock.patch.object(M, "rocm_smi_gpus", lambda: []), mock.patch.object(M, "kfd_gpus", lambda: []), \
++                mock.patch.object(intel_app, "arc_cards", lambda root="": [dict(A750)]), mock.patch.object(intel_app, "engine_is_intel", lambda: True), \
++                mock.patch("strata_control.engine_component.status", lambda: {"usable": False}):
++            hw = s._hardware()
++        self.assertEqual([(g["vendor"], g["name"], g["vram_gb"], g["id"]) for g in hw["gpus"]], [("intel", "Intel Arc A750", 8.0, "intel:0")])
++        self.assertEqual(hw["engine_vendor"], "intel")
++        self.assertEqual([g["name"] for g in s.engine_gpus(hw)], ["Intel Arc A750"])
++
++
++class Recommendation(unittest.TestCase):
++    def test_an_arc_is_a_sycl_pc_and_says_there_is_no_download(self):
++        s = M.Strata(ROOT)
++        rec = s.recommend({"ram_gb": 64.0, "gpus": [dict(A750)], "engine_vendor": "intel", "cpu": {"avx2": True}})
++        self.assertEqual(rec["backend"], "sycl")
++        self.assertIn(intel_app.NO_DOWNLOAD, rec["notes"])
++        self.assertTrue(rec["setup_command"].endswith(" --backend sycl"))
++
++    def test_nvidia_and_amd_recommendations_are_unchanged(self):
++        s = M.Strata(ROOT)
++        rec = s.recommend({"ram_gb": 64.0, "gpus": [dict(NVIDIA)], "cpu": {"avx2": True}})
++        self.assertEqual(rec["backend"], "cuda")
++        self.assertNotIn("--backend", rec["setup_command"])
++        self.assertNotIn(intel_app.NO_DOWNLOAD, rec["notes"])
++        rec = s.recommend({"ram_gb": 64.0, "gpus": [dict(AMD)], "cpu": {"avx2": True}})
++        self.assertEqual(rec["backend"], "hip")
++        self.assertTrue(rec["setup_command"].endswith(" --backend hip"))
++
++
++class InstallPlan(unittest.TestCase):
++    def plan(self, gpus, *, backend=None, family="qwen", model="Q2_0", gguf_dir=None, data_dir=None, drafter="dflash2", vision="no", engine_vendor=None):
++        s = M.Strata(ROOT)
++        hw = {"ram_gb": 64.0, "gpus": [dict(g) for g in gpus], "cpu": {"avx2": True}, **({"engine_vendor": engine_vendor} if engine_vendor else {})}
++        s.hardware = lambda fresh=False: hw
++        s.disk_free = lambda p: 1000.0
++        with mock.patch.object(M.sys, "platform", "linux"), mock.patch.object(M, "WIN", False):
++            return M.Tools(s).install_plan(family, model, 32768, vision, "int8", None, None, backend, None, None, data_dir, gguf_dir, drafter)
++
++    def test_the_apps_request_on_an_arc_passes_backend_sycl(self):
++        """The exact request QAGUI-LIN saw the app make (own folder, 32K, int8, DFlash2): now with --backend sycl and without the drafter."""
++        with tempfile.TemporaryDirectory() as t:
++            folder = Path(t) / "Q2_0"
++            shards(folder)
++            plan, args = self.plan([A750], gguf_dir=str(folder), engine_vendor="intel")
++        self.assertEqual(args, ["--yes", "--no-start", "--family", "qwen", "--model", "Q2_0", "--context", "32768", "--vision", "no",
++                                "--experimental-speed-projection", "off", "--kv", "int8", "--gguf-dir", str(folder), "--backend", "sycl"])
++        self.assertTrue(plan["partly_downloaded"])
++
++    def test_pictures_are_off_on_an_arc_even_when_asked_for(self):
++        with tempfile.TemporaryDirectory() as t:
++            folder = Path(t) / "Q2_0"
++            shards(folder)
++            _plan, args = self.plan([A750], gguf_dir=str(folder), vision="yes")
++        self.assertEqual(args[args.index("--vision") + 1], "no")
++
++    def test_the_backend_can_be_named(self):
++        with tempfile.TemporaryDirectory() as t:
++            folder = Path(t) / "Q2_0"
++            shards(folder)
++            _plan, args = self.plan([A750], backend="sycl", gguf_dir=str(folder))
++        self.assertEqual(args[-2:], ["--backend", "sycl"])
++        with self.assertRaises(M.ToolError) as raised:                       # sycl on a PC with no Arc card
++            self.plan([NVIDIA], backend="sycl")
++        self.assertIn("no Intel Arc card", str(raised.exception))
++
++    def test_without_the_files_there_is_no_download_and_the_words_say_so(self):
++        with tempfile.TemporaryDirectory() as t:
++            data = Path(t) / "Strata-data"
++            data.mkdir()
++            with self.assertRaises(M.ToolError) as raised:
++                self.plan([A750], data_dir=str(data))
++            self.assertEqual(str(raised.exception), intel_app.NO_DOWNLOAD)
++            shards(data / "models" / "Q2_0")                                   # the files are where the Terminal looks (<data>/models/<tag>)
++            plan, args = self.plan([A750], data_dir=str(data))
++        self.assertEqual(args[-2:], ["--backend", "sycl"])
++        self.assertNotIn("--gguf-dir", args)
++        self.assertTrue(plan["partly_downloaded"])
++
++    def test_a_model_the_run_config_cannot_be_written_for_is_refused(self):
++        with self.assertRaises(M.ToolError) as raised:
++            self.plan([A750], family="deepseek41", model="IST-DAS-2.00bpw", gguf_dir=None)
++        self.assertIn("Intel Arc", str(raised.exception))
++
++    def test_nvidia_and_amd_requests_are_byte_identical_to_before(self):
++        with tempfile.TemporaryDirectory() as t:
++            folder = Path(t) / "Q2_0"
++            shards(folder)
++            _plan, nvidia = self.plan([NVIDIA], gguf_dir=str(folder))
++            _plan, amd = self.plan([AMD], gguf_dir=str(folder))
++            _plan, amd_named = self.plan([AMD], backend="hip", gguf_dir=str(folder))
++            _plan, cuda_named = self.plan([NVIDIA], backend="cuda", gguf_dir=str(folder))
++        base = ["--yes", "--no-start", "--family", "qwen", "--model", "Q2_0", "--context", "32768", "--vision", "no",
++                "--experimental-speed-projection", "off", "--kv", "int8", "--gguf-dir", str(folder)]
++        self.assertEqual(nvidia, base + ["--drafter", "dflash2"])
++        self.assertEqual(amd, base + ["--drafter", "dflash2"])
++        self.assertEqual(amd_named, base + ["--backend", "hip", "--drafter", "dflash2"])
++        self.assertEqual(cuda_named, base + ["--backend", "cuda", "--drafter", "dflash2"])
++
++    def test_an_arc_beside_an_nvidia_card_is_an_nvidia_install(self):
++        """The card list only holds an Arc when no usable NVIDIA / AMD card is there, so a mixed PC takes the old path."""
++        with tempfile.TemporaryDirectory() as t:
++            folder = Path(t) / "Q2_0"
++            shards(folder)
++            _plan, args = self.plan([NVIDIA], gguf_dir=str(folder))
++        self.assertNotIn("sycl", args)
++
++    def test_the_tool_schema_offers_sycl(self):
++        s = M.Strata(ROOT)
++        tools = {t["name"]: t for t in M.Tools(s).definitions()} if hasattr(M.Tools, "definitions") else {}
++        if tools:
++            self.assertEqual(tools["strata_install"]["inputSchema"]["properties"]["backend"]["enum"], ["auto", "cuda", "hip", "sycl"])
++        else:
++            self.assertIn('"enum": ["auto", "cuda", "hip", "sycl"]', (ROOT / "tools" / "strata_mcp.py").read_text(encoding="utf-8"))
++
++
++class SetupControlMode(unittest.TestCase):
++    def args(self, folder, **kw):
++        base = dict(family="qwen", model="Q2_0", gguf_dir=str(folder), models_dir=None, data_dir=None, context=32768, kv="int8", port=None, host=None,
++                    api_key=None, browser=None, check=False, yes=True, move_data=False, set_default_data_dir=False, prepare_pack=None)
++        base.update(kw)
++        return mock.Mock(**base)
++
++    def run_setup(self, a, data, home, *, driver="xe", prepared=True):
++        def fake_pack(args):
++            pack = Path(args.prepare_pack)
++            (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
++            (pack / "tokenizer" / "vocab.json").write_text("{}")
++            (pack / "index.txt").write_text("x")
++            self.packed = args.prepare_pack
++            return 0
++        self.packed = None
++        with mock.patch.object(setup, "CONTROL", True), mock.patch.object(setup, "_CONTROL_HOME", home), \
++                mock.patch.object(setup, "data_folder_for", lambda a: (data, [])), \
++                mock.patch.object(setup, "prepare_pack_only", fake_pack), \
++                mock.patch.object(intel_app, "arc_cards", lambda root="": [dict(A750)]), \
++                mock.patch("strata_cli.launch.adopt.intel_driver", lambda: driver), \
++                mock.patch.object(intel_app, "supported_here", lambda platform=None: True):
++            return setup.intel_control_setup(a)
++
++    def test_the_pack_and_the_run_config_are_written_as_the_terminal_writes_them(self):
++        with tempfile.TemporaryDirectory() as t:
++            t = Path(t)
++            folder, data, home = t / "Q2_0", t / "Strata-data", t / "install"
++            files = shards(folder)
++            home.mkdir()
++            data.mkdir()
++            self.assertEqual(self.run_setup(self.args(folder), data, home, driver="i915"), 0)
++            self.assertEqual(self.packed, str(data / "packs" / "q2_0"))
++            cfg = json.loads((home / "strata-q2_0.json").read_text(encoding="utf-8"))
++        self.assertEqual((cfg["exe"], cfg["backend"], cfg["port"]), ("component:strata-engine", "sycl", 8080))
++        a = cfg["args"]
++        self.assertEqual(a[a.index("--pack") + 1], str(data / "packs" / "q2_0"))
++        self.assertEqual(a[a.index("--native") + 1], str(files[0]))
++        self.assertEqual(a[a.index("--ple-gguf") + 1], str(files[-1]))
++        self.assertEqual(a[a.index("--ple-io") + 1], "ram")                    # the A750 runs on i915
++        self.assertEqual(a[a.index("--kv") + 1], "int8")
++        self.assertNotIn("--vision", a)
++        self.assertEqual(cfg["tokenizer"], str(data / "packs" / "q2_0" / "tokenizer"))
++
++    def test_a_b_series_card_streams_its_experts(self):
++        with tempfile.TemporaryDirectory() as t:
++            t = Path(t)
++            folder, data, home = t / "Q2_0", t / "Strata-data", t / "install"
++            shards(folder)
++            home.mkdir()
++            data.mkdir()
++            self.run_setup(self.args(folder, port=8123), data, home, driver="xe")
++            cfg = json.loads((home / "strata-q2_0.json").read_text(encoding="utf-8"))
++        self.assertIn("--stream-experts", cfg["args"])
++        self.assertEqual(cfg["port"], 8123)
++
++    def test_no_files_no_download(self):
++        with tempfile.TemporaryDirectory() as t:
++            t = Path(t)
++            (t / "empty").mkdir()
++            home = t / "install"
++            home.mkdir()
++            with self.assertRaises(SystemExit):
++                self.run_setup(self.args(t / "empty"), t / "Strata-data", home)
++            self.assertIsNone(self.packed)
++            self.assertEqual(list(home.glob("strata-*.json")), [])
++
++    def test_the_dispatch_in_main_is_by_mode(self):
++        """CONTROL mode (the app, the Terminal's installer mode) prepares and adopts; a checkout keeps the from-source Intel setup."""
++        for control, expect in ((True, "intel_control_setup"), (False, "sycl_setup")):
++            with mock.patch.object(setup, "CONTROL", control), mock.patch.object(setup, "intel_control_setup", return_value=11) as ctl, \
++                    mock.patch.object(setup, "sycl_setup", return_value=22) as old, mock.patch.object(sys, "argv", ["setup.py", "--backend", "sycl", "--yes"]):
++                self.assertEqual(setup.main(), 11 if control else 22)
++                self.assertEqual((ctl.called, old.called), (control, not control), expect)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/terminal/test_tui2_023_versions.py b/tests/terminal/test_tui2_023_versions.py
+index 6a79ce61df7..abf3d74a442 100644
+--- a/tests/terminal/test_tui2_023_versions.py
++++ b/tests/terminal/test_tui2_023_versions.py
+@@ -31,9 +31,10 @@ def test_the_terminal_is_0_2_4_2_and_control_is_0_1_49_2_while_the_app_stays_0_2
+         # 0.2.8: Terminal and app are 0.2.8; Control and every engine package (Qwen, DeepSeek, Metal, SYCL, aarch64) are 0.1.54 (both engines changed since 0.2.7.1).
+         # 0.2.7.1 (DGX Spark): Control and the linux-aarch64 engine packages are 0.1.53 (the CMake project version); the app and the Terminal stay 0.2.7, the Metal engine 0.1.52.
+         # 0.2.7: Terminal and app are 0.2.7; Control and every engine package (Qwen, DeepSeek, Metal) are 0.1.52 (the CMake project version; the Qwen and DeepSeek C++ both changed since 0.2.6)
+-        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.13")
+-        self.assertEqual(strata_cli.version(), "0.1.59")                # the CMake project version
+-        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.59")
++        # 0.2.13.1 (Control-only, Linux x86_64: the app on an Intel Arc card, ARCFIX): the Terminal is 0.2.13.1 and Control 0.1.59.1 (the CMake project version); the app stays 0.2.13 and every engine package 0.1.59 (as 0.2.8.1 and 0.2.3.1 did).
++        self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.13.1")
++        self.assertEqual(strata_cli.version(), "0.1.59.1")              # the CMake project version: Control
++        self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.59.1")
+         self.assertIn('STRATA_VERSION="0.1.59-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
+ 
+     def test_every_place_the_app_version_lives_says_0_2_3(self):
+@@ -56,7 +57,7 @@ def test_the_documents_that_state_the_current_version_agree(self):
+     def test_version_prints_the_product_and_the_build(self):
+         done = subprocess.run([sys.executable, str(ROOT / "strata.py"), "--version"], capture_output=True, text=True, cwd=str(ROOT),
+                               env={**os.environ, "STRATA_NO_HANDOVER": "1"})
+-        self.assertTrue(done.stdout.startswith("strata 0.2.13 (build 0.1.59;"), done.stdout)
++        self.assertTrue(done.stdout.startswith("strata 0.2.13.1 (build 0.1.59.1;"), done.stdout)
+ 
+ 
+ class UpdateFromTheLastRelease(test_updater.UpdaterCase):
+diff --git a/tools/strata_mcp.py b/tools/strata_mcp.py
+index 181aacea3cc..b5c01278c40 100644
+--- a/tools/strata_mcp.py
++++ b/tools/strata_mcp.py
+@@ -1021,7 +1021,16 @@ def _hardware(self) -> dict:
+             mark_display(nv + amd, nvidia_display_active() if nv else {}, windows_desktop_adapters() if WIN and amd else [])
+         except Exception:                               # noqa: BLE001 - unknown stays unknown: the app then keeps its safety default
+             pass
+-        hw["gpus"] = nv + amd
++        arc = []
++        if not WIN:                                     # an Intel Arc (Linux, the SYCL engine): only a PC with no usable NVIDIA or AMD card gets one (strata_control/intel_app.py)
++            try:
++                if str(self.src) not in sys.path:
++                    sys.path.insert(0, str(self.src))
++                from strata_control import intel_app
++                arc = intel_app.cards_to_add(nv, amd)
++            except Exception:                           # noqa: BLE001 - an older Control folder without it: the report is what it was
++                arc = []
++        hw["gpus"] = nv + amd + arc
+         for g in hw["gpus"]:                            # each make numbers its cards from 0 (the engine drives one make): a stable id tells two cards apart
+             g.setdefault("id", f"{g.get('vendor') or 'gpu'}:{g.get('index')}")
+         try:                                            # how fast each card is (SMs x clock): the app and the Terminal pick the Main card by it
+@@ -1254,7 +1263,7 @@ def recommend(self, hw: dict) -> dict:
+             return {"family": None, "model": None, "why": why}
+         best = max(usable, key=lambda g: (round(g["vram_gb"]), -g.get("index", 0)))
+         vram = best["vram_gb"]
+-        backend = "hip" if best.get("vendor") == "amd" else "cuda"
++        backend = "hip" if best.get("vendor") == "amd" else "sycl" if best.get("vendor") == "intel" else "cuda"
+ 
+         def low_fits(m):
+             try:
+@@ -1317,8 +1326,11 @@ def low_fits(m):
+                          "older CPU (10-20 minutes), and the CPU's share of the experts runs a few times slower")
+         if backend == "hip":
+             notes.append("AMD (experimental): pictures are on; the reader runs on the CPU under 24 GB of VRAM and on the GPU from 24 GB")
++        if backend == "sycl":
++            from strata_control import intel_app
++            notes.append(intel_app.NO_DOWNLOAD)
+         cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
+-               f" --yes --family {fam} --model {model} --context {ctx}" + (" --backend hip" if backend == "hip" else ""))
++               f" --yes --family {fam} --model {model} --context {ctx}" + (f" --backend {backend}" if backend in ("hip", "sycl") else ""))
+         return {"family": fam, "model": model, "title": families[fam]["title"] + " " + model, "context": ctx,
+                 "backend": backend, "gpu": {k: best.get(k) for k in ("index", "name", "vram_gb")},
+                 "download_gb": models[model]["download_gb"], "why": why, "notes": notes, "setup_command": cmd}
+@@ -2071,8 +2083,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
+                      "description": "one GPU, as nvidia-smi numbers them (default: the one with the most VRAM)"},
+              "gpus": {"type": "string", "pattern": GPUS_PATTERN, "maxLength": 40,
+                       "description": "several GPUs sharing the model: '0,2' or 'all' (experimental)"},
+-             "backend": {"type": "string", "enum": ["auto", "cuda", "hip"],
+-                         "description": "auto (default), cuda = NVIDIA, hip = AMD on Linux (experimental)"},
++             "backend": {"type": "string", "enum": ["auto", "cuda", "hip", "sycl"],
++                         "description": "auto (default), cuda = NVIDIA, hip = AMD on Linux (experimental), sycl = Intel Arc on Linux "
++                                        "(experimental; the model's files must already be on this computer: gguf_dir)"},
+              "low_ram": {"type": "string", "enum": ["auto", "on", "off", "resident", "mmap"],
+                          "description": "setup's low-RAM mode (default auto)"},
+              "port": {**port, "description": "the port the model will listen on (default 8080)"},
+@@ -2411,6 +2424,19 @@ def install_plan(self, family, model, context, vision, kv, gpu, gpus, backend, l
+         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
+         tag = (families[family].get("tag", "") + model)
+         have_dir = target / "models" / tag
++        # An Intel Arc (Linux, the SYCL engine): setup.py's `--backend sycl` in its CONTROL mode prepares the model's files and writes the run config, as the
++        # Terminal does (strata_control/intel_app.py); it downloads nothing. NVIDIA and AMD never come here.
++        arc = backend == "sycl" or (backend in (None, "auto") and any(g.get("vendor") == "intel" for g in hw.get("gpus", [])))
++        if arc:
++            from strata_control import intel_app
++            if mac or not intel_app.supported_here() or not any(g.get("vendor") == "intel" for g in hw.get("gpus", [])):
++                raise ToolError("no Intel Arc card Strata can use was found in this computer (the Intel Arc engine runs on Linux)")
++            if md.get("multi_file") or family not in intel_app.families():
++                raise ToolError(f"{families[family]['title']} {model} can't be set up for an Intel Arc card yet; "
++                                "the Qwen3.8-Flash-Next, Swift, Coder, Gyro and Unsloth sizes can")
++            backend, vision = "sycl", "no"                  # pictures stay off on an Arc (strata_cli/launch/adopt.py)
++            if not gguf_dir and not intel_app.model_files_in(have_dir, family):
++                raise ToolError(intel_app.NO_DOWNLOAD)
+         partly = (have_dir.is_dir() and any(have_dir.glob("*.gguf*"))) or bool(gguf_dir)   # a local folder: nothing to download
+         need = (8 if partly else md["download_gb"] + 8) + (1 if vision in ("yes", "gpu", "cpu") else 0)             + (s.mac().repacked_gb(model) if mac and s.mac() else 0)       # a Mac repacks Unsloth's shards into one file for the GPU (mac_fit.repacked_gb)
+         free = s.disk_free(target)
+@@ -2434,9 +2460,9 @@ def install_plan(self, family, model, context, vision, kv, gpu, gpus, backend, l
+             if not local.is_absolute() or not local.is_dir() or ".." in local.parts:
+                 raise ToolError("gguf_dir must be an existing absolute folder")
+             args += ["--gguf-dir", str(local)]
+-        if backend in ("cuda", "hip"):
++        if backend in ("cuda", "hip", "sycl"):
+             args += ["--backend", backend]
+-        if drafter in ("mtp", "dflash2"):
++        if drafter in ("mtp", "dflash2") and backend != "sycl":      # an Arc runs with no drafter the installer sets up (the Terminal's adopted config has none either)
+             args += ["--drafter", drafter]
+         fit = None
+         ram = hw.get("ram_gb")
