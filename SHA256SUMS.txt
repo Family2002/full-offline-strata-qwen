@@ -1,12 +1,7 @@
 c2c6f3bf2de97a86c1d92505836323c6336f7666fdf475e0e03d382bb088fe90  Strata-0.2.13-offline-r1-windows-x64-cuda12-cuda13-setup.exe  1697218945
 89aa4b837fb491dd8a1f95b5d519473686eff7a9279616314c966174b9a812bd  Strata-0.2.13-offline-r1-drafts.tar  2550261760
-130714284052f2738f2dae94ea401225d726660cd0dc3e63201b1087944a6efa  Strata-0.2.13-offline-r1-linux-x86_64-portable.tar  6677780480
 
 # upload pieces (a file at or under 1900 MiB is stored whole)
 c2c6f3bf2de97a86c1d92505836323c6336f7666fdf475e0e03d382bb088fe90  Strata-0.2.13-offline-r1-windows-x64-cuda12-cuda13-setup.exe  1697218945
 5ba7feb3ba9a3e99554b57505977aab894e703197ff2079199745780e8c2e401  Strata-0.2.13-offline-r1-drafts.tar.part-00  1992294400
 f48c6e1d887a82658abdb1b1918f7690571cdfb3439a9d77f7aaee5533ddc6d2  Strata-0.2.13-offline-r1-drafts.tar.part-01  557967360
-6ac3ee9d3c05ea37ab0bc93d576e758d790f01d003cb055cda90fe039b9d559b  Strata-0.2.13-offline-r1-linux-x86_64-portable.tar.part-00  1992294400
-7956a1f094882a24000bb914f86b3d0ac3b5c949dc34d45a57e9476420fc92d2  Strata-0.2.13-offline-r1-linux-x86_64-portable.tar.part-01  1992294400
-e3f498e5dbec072088888bfbd75dac45139682eb2de91cb2a0bd37323e70e52e  Strata-0.2.13-offline-r1-linux-x86_64-portable.tar.part-02  1992294400
-e4b9f97db3dc77ca3f1e57f8e92922062e6e7f2d7673b5a9ca25b5724f5f16dc  Strata-0.2.13-offline-r1-linux-x86_64-portable.tar.part-03  700897280

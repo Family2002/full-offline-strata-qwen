@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Build the v0.2.13 offline Windows installer and Linux portable tree.
+"""Build the offline Windows installer.
 
-The script clones Niko1221/Strata tag v0.2.13, applies the patches in ../patches,
-downloads the pinned upstream binaries, and packs them. It does not commit those
-binaries. A machine that already has the patched trees and the download cache can
-reuse them:
+The script clones the pinned upstream tag, applies patches/offline-entry-v0.2.13.patch,
+downloads the pinned upstream binaries, and packs a Windows installer plus a drafts
+archive. It does not commit those binaries. A machine that already has the patched
+tree and the download cache can reuse them:
 
-    STRATA_SRC=/tmp/strata-v0213 STRATA_LINUX_SRC=/tmp/strata-linux-src \\
-    STRATA_CACHE=/tmp/strata-cache python3 packaging/build_offline_release.py
+    STRATA_SRC=/tmp/strata-v0213 STRATA_CACHE=/tmp/strata-cache \\
+        python3 packaging/build_offline_release.py
 
-The target PC does not run this script. Nothing here installs a GPU driver.
+    python3 packaging/build_offline_release.py --dry-run
+
+The Windows PC does not run this script. Nothing here installs a GPU driver.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tarfile
@@ -27,7 +27,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_OFFLINE = ROOT / "patches" / "offline-entry-v0.2.13.patch"
-PATCH_LINUX = ROOT / "patches" / "linux-control-0.1.59.1.patch"
 CACHE = Path(os.environ.get("STRATA_CACHE", "/tmp/strata-offline-cache-0213"))
 WORK = Path(os.environ.get("STRATA_WORK", "/tmp/strata-offline-work-0213"))
 OUT = Path(os.environ.get("STRATA_OUT", "/tmp/strata-offline-out-0213"))
@@ -42,10 +41,6 @@ PINS = {
         "https://nodejs.org/dist/v24.12.0/node-v24.12.0-win-x64.zip",
         "9c125f61ae947b52e779095830f9cac267846a043ef7192183c84016aaad2812",
     ),
-    "node-linux.tar.gz": (
-        "https://nodejs.org/dist/v24.12.0/node-v24.12.0-linux-x64.tar.gz",
-        "6159227e0af7d7c3c6bb2fa900452b04a6cb8841a702a79acc613209d70b04d0",
-    ),
     "llama.zip": (
         "https://github.com/ggml-org/llama.cpp/archive/3cf03257f219afbe7334045ff7c6a06ac68c627d.zip",
         "cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b",
@@ -54,10 +49,6 @@ PINS = {
         RELEASE + "strata-control-0.1.59-windows-x86_64.zip",
         "c81f6800094942a5e750c7d93f348062bc16484f946ea83b0c0d2f8c91c44e87",
     ),
-    "control-linux.tar.gz": (
-        RELEASE + "strata-control-0.1.59.1-linux-x86_64.tar.gz",
-        "73fb612848cf00fa1072623029b35405bbbb63e3f4c688fe6f38c78e3fc022ac",
-    ),
     "engine-win-cuda12.tar.gz": (
         RELEASE + "strata-engine-0.1.59-windows-x86_64-cuda-cuda12.tar.gz",
         "934ac7f321e89a8935c26037ff32fcc0acce526e492c544b98aaf5dec86dbe46",
@@ -65,18 +56,6 @@ PINS = {
     "engine-win-cuda13.tar.gz": (
         RELEASE + "strata-engine-0.1.59-windows-x86_64-cuda-cuda13.tar.gz",
         "3f071a7ccbbf3dcdefed8bff777896d8dd0b580417a078154a7d2c2402ec4158",
-    ),
-    "engine-linux-cuda12.tar.gz": (
-        RELEASE + "strata-engine-0.1.59-linux-x86_64-cuda-cuda12.tar.gz",
-        "4bf321cb0c2d7ff15fe221f22a29aeb8371f24fa77a4425c920eb01a520babbc",
-    ),
-    "engine-linux-cuda13.tar.gz": (
-        RELEASE + "strata-engine-0.1.59-linux-x86_64-cuda-cuda13.tar.gz",
-        "42ab04fa3201e41bef5fac28c05f5c35c909419ec937d879b505bf1516742610",
-    ),
-    "engine-linux-sycl.tar.gz": (
-        RELEASE + "strata-engine-0.1.59-linux-x86_64-sycl.tar.gz",
-        "8b2586ab57a2ad8df593d11dc6a3509620ca49fb352692ae0f7f4f7d014a7839",
     ),
     "dflash-selq4.pack": (
         RELEASE + "qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack",
@@ -91,11 +70,6 @@ PINS = {
 WIN_ENGINES = {
     "engine-win-cuda12.tar.gz": "0.1.59-windows-x86_64-cuda-cuda12",
     "engine-win-cuda13.tar.gz": "0.1.59-windows-x86_64-cuda-cuda13",
-}
-LINUX_ENGINES = {
-    "engine-linux-cuda12.tar.gz": "0.1.59-linux-x86_64-cuda-cuda12",
-    "engine-linux-cuda13.tar.gz": "0.1.59-linux-x86_64-cuda-cuda13",
-    "engine-linux-sycl.tar.gz": "0.1.59-linux-x86_64-sycl",
 }
 
 
@@ -131,7 +105,7 @@ def copy_tree(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.map"))
 
 
-def prepare_source(env_name: str, dest: Path, extra_patch: Path | None) -> Path:
+def prepare_source(env_name: str, dest: Path) -> Path:
     given = os.environ.get(env_name)
     if given:
         path = Path(given)
@@ -139,15 +113,13 @@ def prepare_source(env_name: str, dest: Path, extra_patch: Path | None) -> Path:
             raise SystemExit(f"{env_name}={path} has no offline entry")
         print(f"reuse {env_name} {path}", flush=True)
         return path
-    if dest.exists() and (dest / "strata_control" / "windows_offline.py").is_file() and extra_patch is None:
+    if dest.exists() and (dest / "strata_control" / "windows_offline.py").is_file():
         return dest
     if dest.exists():
         shutil.rmtree(dest)
     print(f"cloning {TAG} into {dest}", flush=True)
     subprocess.run(["git", "clone", "--depth", "1", "--branch", TAG, UPSTREAM, str(dest)], check=True)
     subprocess.run(["git", "apply", "--whitespace=nowarn", str(PATCH_OFFLINE)], cwd=dest, check=True)
-    if extra_patch is not None:
-        subprocess.run(["git", "apply", "--whitespace=nowarn", str(extra_patch)], cwd=dest, check=True)
     return dest
 
 
@@ -191,7 +163,7 @@ def extract_engines(payload: Path, mapping: dict[str, str]) -> None:
             raise SystemExit(f"{archive_name} has no engine-component.json")
 
 
-def overlay_control(payload: Path, src: Path, *, linux: bool) -> None:
+def overlay_control(payload: Path, src: Path) -> None:
     control = payload / "control"
     for name in ("strata.py", "setup.py"):
         shutil.copy2(src / name, control / name)
@@ -200,8 +172,6 @@ def overlay_control(payload: Path, src: Path, *, linux: bool) -> None:
     tools = control / "tools"
     tools.mkdir(exist_ok=True)
     shutil.copy2(src / "tools" / "mtp_fetch.py", tools / "mtp_fetch.py")
-    if linux:
-        shutil.copy2(src / "tools" / "strata_mcp.py", tools / "strata_mcp.py")
     packaged = control / "packaging"
     packaged.mkdir(exist_ok=True)
     shutil.copy2(src / "packaging" / "binary_deps.py", packaged / "binary_deps.py")
@@ -215,19 +185,6 @@ def stage_host(payload: Path, src: Path) -> None:
     copy_tree(src / "apps" / "host" / "dist", host / "dist")
     if not (host / "dist" / "index.html").is_file():
         raise SystemExit("host/dist/index.html is missing")
-
-
-def extract_node_linux(payload: Path) -> None:
-    dest = payload / "node"
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fetch("node-linux.tar.gz")) as archive:
-        member = next(item for item in archive.getmembers() if item.name.endswith("/bin/node") and item.isfile())
-        data = archive.extractfile(member)
-        if data is None:
-            raise SystemExit("linux node tarball has no bin/node")
-        target = dest / "node"
-        target.write_bytes(data.read())
-        target.chmod(target.stat().st_mode | stat.S_IEXEC)
 
 
 def copy_drafts(data: Path, src: Path, mtp_rt: Path | None) -> None:
@@ -315,57 +272,14 @@ def windows_note() -> str:
         模型权重不在这个包里。页面里选择已经下好的 GGUF，或 Start-Strata.cmd --model 指向那个文件或文件夹。
         本包装进的准备只处理 qwen4exp（Qwen3.8-Flash-Next）。DeepSeek 引擎不在这个包里。
 
-        草稿：DFlash2 的两个 tuned pack 和准备好的 MTP 运行时在单独的 drafts 压缩包里，
+        草稿：DFlash2 和准备好的 MTP 运行时在单独的 drafts 压缩包里，
         解压到本目录的 data\\ 下（与 Start-Strata.cmd 同级出现 data\\dflash2 和 data\\mtp）。
         若那些文件不在，启动不会下载它们：DFlash2 保持未安装，选择 MTP 时准备步骤会停下并说明缺文件。
 
         页面里的 Drafting 可以选择 Auto、MTP、DFlash2 或 Off。
-        终端里同一份运行配置的 drafting 字段用这四个词。确认生效时看引擎启动参数：
-        DFlash2 含 --draft dflash2 和 --draft-model，并且指向 data\\dflash2 里的 pack；
-        MTP 含 --mtp，并且指向 data\\mtp\\rt。
+        选中之后，页面上的草稿说明会显示当前用的是哪一种。
 
         显卡驱动是唯一需要目标系统自己具备的 GPU 组件。没有 NVIDIA 驱动时，程序只报告缺驱动并退出。
-    """).strip() + "\n"
-
-
-def linux_note() -> str:
-    return textwrap.dedent("""
-        Strata 0.2.13 离线便携包（Linux x86_64）
-
-        应用页面来自上游标签 v0.2.13（提交 d2f096475）。
-        Control 用的是发布文件 strata-control-0.1.59.1-linux-x86_64.tar.gz，再叠上离线入口。
-        这就是 v0.2.13 发布说明里的 0.2.13.1：Linux 桌面在 Intel Arc 上准备模型时不再停在
-        “no NVIDIA GPU found”。VERSION 是 0.1.59.1，Terminal 产品版本字符串是 0.2.13.1。
-        引擎仍是 0.1.59，没有 0.1.59.1 的引擎包。
-
-        三套引擎目录分开：
-        - CUDA 12.9：components/engine/0.1.59-linux-x86_64-cuda-cuda12
-          显卡代码 sm_60 到 sm_89，另有 compute_89。驱动门槛 NVIDIA 575.51。
-        - CUDA 13.0：components/engine/0.1.59-linux-x86_64-cuda-cuda13
-          显卡代码 sm_75、sm_86、sm_89、sm_120，另有 compute_120。驱动门槛 NVIDIA 580.65。
-        - SYCL（Intel Arc）：components/engine/0.1.59-linux-x86_64-sycl
-          没有 NVIDIA 驱动时自动用这一套。Start-Strata.sh --cuda sycl 可以指定。
-
-        读到 NVIDIA 显卡代码并且两套 CUDA 都符合时用 CUDA 13。没有读到计算能力时不猜 CUDA 13。
-        没有 NVIDIA、并且本包有 SYCL 引擎时，用 SYCL，不要求先装 NVIDIA 驱动。
-        AMD HIP 引擎不在这个包里。
-
-        解压后执行 ./Start-Strata.sh。用已经装在这台电脑上的浏览器打开它打印的
-        http://127.0.0.1:8791/ 。不安装系统 Python、Node 或 CUDA Toolkit。
-        模型权重不在包里。--model 指向本机 GGUF 文件或文件夹。
-        准备只处理 qwen4exp。DeepSeek 引擎不在这个包里。
-
-        DFlash2 的两个 tuned pack（selq4 约 0.32 GiB，bf16sel 约 0.49 GiB）在 data/dflash2/。
-        准备好的 MTP 运行时在 data/mtp/rt/（experts.bin、dense.bin、dense.txt 和 draft_vocab.bin）。
-        这些文件随本便携包一起提供，第一次启动不会再下载它们。
-        缺文件时不会联网去补：DFlash2 保持未安装；选择 MTP 而 experts.bin 不在时，准备步骤停下并说明缺什么。
-
-        页面 Drafting：Auto、MTP、DFlash2、Off。
-        生效时引擎参数里能看到 --draft dflash2 --draft-model <data/dflash2 里的 pack>，
-        或 --mtp <data/mtp/rt>。Auto 在这块卡的默认是 DFlash2 时用 selq4（引擎能读 Q4_0 selector 时）
-        或 bf16sel（SYCL 引擎读 bf16 selector）。卡片不适合 DFlash2 时 Auto 用 MTP。
-
-        显卡驱动要系统自己有：NVIDIA 驱动，或 Intel GPU 的 Level Zero 驱动。本包不安装驱动。
     """).strip() + "\n"
 
 
@@ -387,22 +301,9 @@ def start_cmd() -> str:
     """).lstrip().replace("\n", "\r\n")
 
 
-def start_sh() -> str:
-    return textwrap.dedent("""
-        #!/bin/sh
-        set -eu
-        cd "$(dirname "$0")"
-        ROOT=$(pwd)
-        if [ ! -f "$ROOT/data/dflash2/qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack" ]; then
-          echo "DFlash2 pack is not in data/dflash2. Drafting stays unavailable. Nothing will be downloaded."
-        fi
-        exec "$ROOT/control/python/bin/python3" "$ROOT/control/strata.py" offline --root "$ROOT" "$@"
-    """).lstrip()
-
-
-def build_record(kind: str) -> str:
+def build_record() -> str:
     lines = [
-        f"offline-v0.2.13-r1 {kind}",
+        "offline-v0.2.13-r1 windows",
         f"upstream tag {TAG} commit {TAG_COMMIT}",
         "app host built from that tag plus the offline entry",
         "node 24.12.0",
@@ -410,30 +311,17 @@ def build_record(kind: str) -> str:
         "serve/server.py is the patched checkout, not the untouched copy from the control archive",
         "control/packaging/binary_deps.py is installed (the 0.2.11 r2 fix)",
         "model weights are not included",
+        "control strata-control-0.1.59-windows-x86_64.zip VERSION 0.1.59 PRODUCT_VERSION 0.2.13",
+        "control commit recorded in that zip: d2f096475817d4666c364c820b0ca830f751cfc5",
+        "engine cuda12 0.1.59 sha256 934ac7f321e89a8935c26037ff32fcc0acce526e492c544b98aaf5dec86dbe46 driver 576.02",
+        "engine cuda13 0.1.59 sha256 3f071a7ccbbf3dcdefed8bff777896d8dd0b580417a078154a7d2c2402ec4158 driver 580.65",
+        "Windows feed has no Control update: an existing 0.2.12 Terminal stays 0.2.12 on strata update. This package is a new tree and its product string is 0.2.13.",
+        "DFlash2 and MTP files are the separate drafts archive, extracted into data\\",
     ]
-    if kind == "windows":
-        lines += [
-            "control strata-control-0.1.59-windows-x86_64.zip VERSION 0.1.59 PRODUCT_VERSION 0.2.13",
-            "control commit recorded in that zip: d2f096475817d4666c364c820b0ca830f751cfc5",
-            "engine cuda12 0.1.59 sha256 934ac7f321e89a8935c26037ff32fcc0acce526e492c544b98aaf5dec86dbe46 driver 576.02",
-            "engine cuda13 0.1.59 sha256 3f071a7ccbbf3dcdefed8bff777896d8dd0b580417a078154a7d2c2402ec4158 driver 580.65",
-            "Windows feed has no Control update: an existing 0.2.12 Terminal stays 0.2.12 on strata update. This package is a new tree and its product string is 0.2.13.",
-            "DFlash2 and MTP files are the separate drafts archive, extracted into data\\",
-        ]
-    else:
-        lines += [
-            "control strata-control-0.1.59.1-linux-x86_64.tar.gz VERSION 0.1.59.1 PRODUCT_VERSION 0.2.13.1",
-            "that archive's COMMIT is 628f74955a56fcba092495b800dd02af75373a0f; the Arc setup fix is commit 1130d824 and the version bump is b08a069d",
-            "engine cuda12 0.1.59 sha256 4bf321cb0c2d7ff15fe221f22a29aeb8371f24fa77a4425c920eb01a520babbc driver 575.51",
-            "engine cuda13 0.1.59 sha256 42ab04fa3201e41bef5fac28c05f5c35c909419ec937d879b505bf1516742610 driver 580.65",
-            "engine sycl 0.1.59 sha256 8b2586ab57a2ad8df593d11dc6a3509620ca49fb352692ae0f7f4f7d014a7839",
-            "DFlash2 packs and the prepared MTP runtime are in data/",
-        ]
     return "\n".join(lines) + "\n"
 
 
 def preflight(payload: Path, src: Path) -> None:
-    # A second payload must not keep the first tree's already-imported modules.
     for name in list(sys.modules):
         if name == "binary_deps" or name == "node_runtime" or name == "strata_control" or name.startswith("strata_control."):
             del sys.modules[name]
@@ -504,20 +392,46 @@ def checksum_lines(paths: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main() -> int:
-    if not PATCH_OFFLINE.is_file() or not PATCH_LINUX.is_file():
+def dry_run() -> int:
+    if not PATCH_OFFLINE.is_file():
+        raise SystemExit(f"missing {PATCH_OFFLINE}")
+    if any("linux" in name for name in PINS):
+        raise SystemExit("a pin name still contains linux")
+    note = windows_note()
+    cmd = start_cmd()
+    record = build_record()
+    if "python.exe" not in cmd or "offline" not in cmd:
+        raise SystemExit("Windows start script is incomplete")
+    if "binary_deps.py" not in note or "drafts" not in note:
+        raise SystemExit("Windows note is incomplete")
+    if "0.1.59.1" in record:
+        raise SystemExit("build record still names the Linux control package")
+    print("dry-run: Windows installer and drafts archive only")
+    print(f"patch {PATCH_OFFLINE.name} ({PATCH_OFFLINE.stat().st_size} bytes)")
+    print("pins " + ", ".join(PINS))
+    print("engines " + ", ".join(WIN_ENGINES.values()))
+    print("outputs: windows setup exe, drafts.tar (split when over 1900 MiB)")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--dry-run"]:
+        return dry_run()
+    if args:
+        raise SystemExit(f"unknown arguments: {args}")
+    if not PATCH_OFFLINE.is_file():
         raise SystemExit("patches are missing")
     WORK.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
-    windows_src = prepare_source("STRATA_SRC", WORK / "src-windows", None)
-    linux_src = prepare_source("STRATA_LINUX_SRC", WORK / "src-linux", PATCH_LINUX)
+    windows_src = prepare_source("STRATA_SRC", WORK / "src-windows")
     ensure_host_dist(windows_src)
     mtp_rt = Path(os.environ.get("STRATA_MTP_RT", "/tmp/mtp-rt"))
     if not (mtp_rt / "experts.bin").is_file():
         print(f"MTP runtime not at {mtp_rt}; drafts will record it as missing", flush=True)
         mtp_rt = None
 
-    # Windows payload. Drafters stay out of the NSIS installer so the exe stays under 2 GiB.
+    # Drafters stay out of the NSIS installer so the exe stays under 2 GiB.
     win = WORK / "windows-payload"
     if win.exists():
         shutil.rmtree(win)
@@ -527,7 +441,7 @@ def main() -> int:
     node_runtime.extract(fetch("node-win.zip"), win / "node")
     with zipfile.ZipFile(fetch("control-win.zip")) as archive:
         archive.extractall(win / "control")
-    overlay_control(win, windows_src, linux=False)
+    overlay_control(win, windows_src)
     extract_engines(win, WIN_ENGINES)
     extract_llama(win)
     stage_host(win, windows_src)
@@ -537,7 +451,7 @@ def main() -> int:
     version_text = (win / "control" / "VERSION").read_text(encoding="utf-8").strip()
     if version_text != "0.1.59":
         raise SystemExit(f"windows VERSION file is {version_text}, expected 0.1.59")
-    write_common_notes(win, windows_note(), build_record("windows"))
+    write_common_notes(win, windows_note(), build_record())
     preflight(win, windows_src)
     exe = WORK / "Strata-0.2.13-offline-r1-windows-x64-cuda12-cuda13-setup.exe"
     if exe.exists():
@@ -545,7 +459,6 @@ def main() -> int:
     print("makensis", flush=True)
     nsis(win, exe)
 
-    # Drafts archive, shared instructions for the Windows install directory.
     drafts = WORK / "drafts-root" / "data"
     if drafts.exists():
         shutil.rmtree(drafts.parent)
@@ -556,43 +469,11 @@ def main() -> int:
     with tarfile.open(drafts_tar, "w") as archive:
         archive.add(drafts.parent / "data", arcname="data")
 
-    # Linux portable, drafts included.
-    lin = WORK / "linux-root" / "Strata-0.2.13-offline-r1-linux-x86_64"
-    if lin.exists():
-        shutil.rmtree(lin.parent)
-    lin.mkdir(parents=True)
-    extract_node_linux(lin)
-    with tarfile.open(fetch("control-linux.tar.gz")) as archive:
-        archive.extractall(lin / "control")
-    overlay_control(lin, linux_src, linux=True)
-    extract_engines(lin, LINUX_ENGINES)
-    extract_llama(lin)
-    stage_host(lin, windows_src)
-    script = lin / "Start-Strata.sh"
-    script.write_text(start_sh(), encoding="utf-8")
-    script.chmod(0o755)
-    if product_version(lin / "control") != "0.2.13.1":
-        raise SystemExit("linux PRODUCT_VERSION is not 0.2.13.1")
-    version_text = (lin / "control" / "VERSION").read_text(encoding="utf-8").strip()
-    if version_text != "0.1.59.1":
-        raise SystemExit(f"linux VERSION file is {version_text}, expected 0.1.59.1")
-    copy_drafts(lin / "data", linux_src, mtp_rt)
-    write_common_notes(lin, linux_note(), build_record("linux"))
-    preflight(lin, linux_src)
-    linux_tar = WORK / "Strata-0.2.13-offline-r1-linux-x86_64-portable.tar"
-    if linux_tar.exists():
-        linux_tar.unlink()
-    print("tar linux", flush=True)
-    with tarfile.open(linux_tar, "w") as archive:
-        archive.add(lin, arcname=lin.name)
-
-    produced = [exe, drafts_tar, linux_tar]
+    produced = [exe, drafts_tar]
     shipped: list[Path] = []
     for item in produced:
         shipped.extend(split_file(item, OUT))
-    whole = []
-    for item in produced:
-        whole.append(f"{sha256(item)}  {item.name}  {item.stat().st_size}")
+    whole = [f"{sha256(item)}  {item.name}  {item.stat().st_size}" for item in produced]
     listing = "\n".join(whole) + "\n\n# upload pieces (a file at or under 1900 MiB is stored whole)\n" + checksum_lines(shipped)
     (OUT / "SHA256SUMS.txt").write_text(listing, encoding="utf-8")
     print(listing)
